@@ -58,6 +58,7 @@ MODEL_NAME = "imagen-3.0-generate-002"  # Fixed model name
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateImage?key={API_KEY}"
 user_requests = defaultdict(list)
 user_stats = defaultdict(lambda: {'requests': 0, 'successful': 0})
+user_conversations = {}  # Track active conversations
 
 # --- Rate Limiting Function ---
 def is_rate_limited(user_id):
@@ -221,6 +222,20 @@ async def test_api_connection():
         logger.error(f"❌ Gemini API connection error: {e}")
         return False
 
+# --- Conversation Handler for Custom Bananas ---
+@client.on(events.NewMessage(func=lambda e: e.sender_id in user_conversations))
+async def handle_custom_response(event):
+    """Handle responses for custom banana conversations"""
+    user_id = event.sender_id
+    
+    if user_id in user_conversations:
+        prompt_type = user_conversations[user_id]
+        del user_conversations[user_id]  # Remove from conversation tracking
+        
+        if prompt_type == "custom_banana":
+            custom_prompt = f"a banana, {event.text}, high quality, realistic"
+            await generate_banana_image(event, custom_prompt)
+
 # --- Telegram Bot Handlers ---
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -267,18 +282,30 @@ async def simple_banana_handler(event):
 @client.on(events.NewMessage(pattern='/custom'))
 async def custom_handler(event):
     """Handler for custom banana requests"""
-    await event.respond("🍌 What kind of banana would you like? Describe it!\n\nExamples:\n- 'a banana wearing sunglasses'\n- 'a banana on the beach'\n- 'a cartoon banana dancing'")
+    user_id = event.sender_id
     
-    # Wait for user response
-    try:
-        response = await client.wait_for(
-            events.NewMessage(chats=event.chat_id, from_users=event.sender_id),
-            timeout=60
-        )
-        custom_prompt = f"a banana, {response.text}, high quality, realistic"
-        await generate_banana_image(event, custom_prompt)
-    except asyncio.TimeoutError:
-        await event.respond("⏰ Sorry, you took too long to respond. Please try again!")
+    # Set user in conversation mode
+    user_conversations[user_id] = "custom_banana"
+    
+    await event.respond(
+        "🍌 What kind of banana would you like? Describe it!\n\n"
+        "Examples:\n"
+        "- 'a banana wearing sunglasses'\n"
+        "- 'a banana on the beach'\n"
+        "- 'a cartoon banana dancing'\n\n"
+        "Please describe your banana now...\n"
+        "(Type /cancel to cancel)"
+    )
+
+@client.on(events.NewMessage(pattern='/cancel'))
+async def cancel_handler(event):
+    """Cancel ongoing conversation"""
+    user_id = event.sender_id
+    if user_id in user_conversations:
+        del user_conversations[user_id]
+        await event.respond("❌ Custom banana request cancelled.")
+    else:
+        await event.respond("ℹ️ No active conversation to cancel.")
 
 @client.on(events.NewMessage(pattern='/test'))
 async def test_handler(event):
@@ -320,6 +347,7 @@ async def help_handler(event):
 /banana - Generate a standard banana image
 /simple - Generate a simple banana (more reliable)
 /custom - Create a custom banana with your description
+/cancel - Cancel current operation
 /stats - View your usage statistics
 /test - Test API connection
 /help - Show this help message
@@ -348,8 +376,10 @@ async def callback_handler(event):
             prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic"
             await generate_banana_image(event, prompt)
         elif data == "custom_banana":
-            await event.edit("🍌 Please describe your custom banana...")
-            await custom_handler(event)
+            await event.edit("🍌 Please use the /custom command to describe your banana!")
+            # Alternatively, we can start conversation directly
+            # user_conversations[user_id] = "custom_banana"
+            # await event.respond("🍌 Please describe your custom banana...")
         elif data == "show_stats":
             await stats_handler(event)
         elif data == "show_help":
@@ -418,12 +448,13 @@ async def main():
     
     # Notify admin
     try:
-        await client.send_message(
-            config.ADMIN_USER_IDS[0],
-            "🍌 Banana Bot started successfully!"
-        )
-    except:
-        logger.warning("Could not send startup message to admin")
+        if config.ADMIN_USER_IDS:
+            await client.send_message(
+                config.ADMIN_USER_IDS[0],
+                "🍌 Banana Bot started successfully!"
+            )
+    except Exception as e:
+        logger.warning(f"Could not send startup message to admin: {e}")
     
     await client.run_until_disconnected()
 

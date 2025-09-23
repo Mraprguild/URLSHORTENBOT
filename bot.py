@@ -1,35 +1,48 @@
 import asyncio
 import requests
 import base64
+import sys
 from telethon import TelegramClient, events
-from dotenv import load_dotenv
 import config  # Import configuration from config.py
 
-# Load environment variables
-load_dotenv()
+# --- Configuration Loading and Validation ---
+try:
+    API_ID = config.API_ID
+    API_HASH = config.API_HASH
+    BOT_TOKEN = config.BOT_TOKEN
+    API_KEY = config.API_KEY # Load Gemini API Key from config
 
-# Load credentials from config.py
-API_ID = config.API_ID
-API_HASH = config.API_HASH
-BOT_TOKEN = config.BOT_TOKEN
-API_KEY = config.API_KEY
-MODEL_NAME = None 
-API_URL = None
+    # Check if the values are actually filled in
+    if not all([API_ID, API_HASH, BOT_TOKEN, API_KEY]):
+        print("ERROR: One or more configuration variables are missing in config.py.")
+        print("Please fill in API_ID, API_HASH, BOT_TOKEN, and API_KEY.")
+        sys.exit(1)
+
+    # Safely convert API_ID to integer
+    API_ID_INT = int(API_ID)
+
+except (AttributeError, ValueError) as e:
+    print(f"ERROR: config.py is missing or a value is incorrect: {e}")
+    print("Please ensure config.py exists and all credentials are set correctly.")
+    sys.exit(1)
+# -----------------------------------------
 
 # Initialize the Telegram client
-client = TelegramClient('bot_session', int(API_ID) if API_ID else None, API_HASH)
+client = TelegramClient('bot_session', API_ID_INT, API_HASH)
+
+# Gemini API configuration (loaded from config)
+MODEL_NAME = None
+API_URL = None
 
 async def get_latest_image_model():
     """Fetches the latest available image generation model from the Gemini API."""
-    list_models_url = f"https://generativelace.googleapis.com/v1beta/models?key={API_KEY}"
+    list_models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     fallback_model = "imagen-3.0-generate-002"
     try:
-        # Run blocking requests.get in a separate thread to avoid blocking the event loop.
         response = await asyncio.to_thread(requests.get, list_models_url)
         response.raise_for_status()
         models = response.json().get("models", [])
         
-        # Filter for public imagen models that support 'predict'
         imagen_models = [
             m for m in models 
             if "imagen" in m.get("name", "") and 
@@ -37,16 +50,15 @@ async def get_latest_image_model():
         ]
         
         if imagen_models:
-            # Sort by name to get the latest version (assuming semantic versioning in name)
             latest_model = sorted(imagen_models, key=lambda x: x['name'], reverse=True)[0]
             model_name = latest_model["name"].split('/')[-1]
             print(f"Auto-detected image model: {model_name}")
             return model_name
         
-        print(f"Could not auto-detect a suitable image model. Falling back to {fallback_model}.")
+        print(f"Could not auto-detect image model. Falling back to {fallback_model}.")
         return fallback_model
     except (requests.exceptions.RequestException, KeyError) as e:
-        print(f"Failed to fetch or parse models: {e}. Falling back to {fallback_model}.")
+        print(f"Failed to fetch models: {e}. Falling back to {fallback_model}.")
         return fallback_model
 
 async def generate_image_with_retry(prompt, max_retries=3):
@@ -58,7 +70,6 @@ async def generate_image_with_retry(prompt, max_retries=3):
     }
     for attempt in range(max_retries):
         try:
-            # Run blocking requests.post in a separate thread
             response = await asyncio.to_thread(
                 requests.post, API_URL, json=payload, headers=headers
             )
@@ -106,10 +117,6 @@ async def banana(event):
 async def main():
     """Main function to start the bot."""
     global MODEL_NAME, API_URL
-
-    if not all([API_ID, API_HASH, BOT_TOKEN]):
-        print("Error: API_ID, API_HASH, and BOT_TOKEN must be set in config.py.")
-        return
 
     MODEL_NAME = await get_latest_image_model()
     API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:predict?key={API_KEY}"

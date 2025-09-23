@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, errors
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 
@@ -154,8 +154,28 @@ class FileUtils:
         return caption
 
 
+# --- Error Handling Decorator ---
+def error_handler(func):
+    """Decorator to handle errors in handlers"""
+    async def wrapper(client: Client, message: Message):
+        try:
+            await func(client, message)
+        except errors.FloodWait as e:
+            logger.warning(f"Flood wait: {e.value} seconds")
+            await message.reply_text(f"❌ Too many requests. Please wait {e.value} seconds.")
+        except errors.RPCError as e:
+            logger.error(f"RPC Error in {func.__name__}: {e}")
+            await message.reply_text("❌ Telegram API error. Please try again later.")
+        except Exception as e:
+            logger.error(f"Unexpected error in {func.__name__}: {e}", exc_info=True)
+            await message.reply_text("❌ An unexpected error occurred. Please try again.")
+    
+    return wrapper
+
+
 # --- Command Handlers ---
 @app.on_message(filters.command("start") & filters.private)
+@error_handler
 async def start_handler(client: Client, message: Message):
     """Handle /start command"""
     if message.from_user.id != config.OWNER_ID:
@@ -174,6 +194,7 @@ async def start_handler(client: Client, message: Message):
 
 
 @app.on_message(filters.command("help") & filters.private)
+@error_handler
 async def help_handler(client: Client, message: Message):
     """Handle /help command"""
     if message.from_user.id != config.OWNER_ID:
@@ -187,6 +208,7 @@ async def help_handler(client: Client, message: Message):
 
 
 @app.on_message(filters.command("stats") & filters.private)
+@error_handler
 async def stats_handler(client: Client, message: Message):
     """Handle /stats command"""
     if message.from_user.id != config.OWNER_ID or not config.ENABLE_STATS:
@@ -213,6 +235,7 @@ async def stats_handler(client: Client, message: Message):
 
 
 @app.on_message(filters.command("config") & filters.private & filters.user(config.OWNER_ID))
+@error_handler
 async def config_handler(client: Client, message: Message):
     """Show current configuration (owner only)"""
     bot_info = config.get_bot_info()
@@ -233,6 +256,7 @@ async def config_handler(client: Client, message: Message):
 
 
 @app.on_message(config.get_supported_media_filters() & filters.private)
+@error_handler
 async def file_handler(client: Client, message: Message):
     """Handle incoming files"""
     if message.from_user.id != config.OWNER_ID:
@@ -296,6 +320,16 @@ async def file_handler(client: Client, message: Message):
         
         logger.info(f"File stored successfully: {file_info['name']}")
 
+    except errors.FloodWait as e:
+        error_text = f"❌ **Upload Failed**\n\nToo many requests. Please wait {e.value} seconds."
+        await processing_message.edit_text(error_text)
+        logger.warning(f"Flood wait during file upload: {e.value} seconds")
+        
+    except errors.ChatAdminRequired:
+        error_text = "❌ **Upload Failed**\n\nBot needs admin rights in the storage channel."
+        await processing_message.edit_text(error_text)
+        logger.error("Bot doesn't have admin rights in storage channel")
+        
     except Exception as e:
         error_text = (
             f"❌ **Upload Failed**\n\n"
@@ -306,11 +340,10 @@ async def file_handler(client: Client, message: Message):
         logger.error(f"Failed to store file: {e}", exc_info=True)
 
 
-# --- Error Handler ---
-@app.on_errors()
-async def error_handler(client: Client, error: Exception, update):
-    """Global error handler"""
-    logger.error(f"Error in update: {error}", exc_info=True)
+# --- Global Exception Handler ---
+async def handle_global_error(update, error):
+    """Global error handler for uncaught exceptions"""
+    logger.error(f"Global error handler: {error}", exc_info=True)
 
 
 # --- Main Execution ---
@@ -322,6 +355,12 @@ async def main():
     try:
         chat = await app.get_chat(config.STORAGE_CHANNEL_ID)
         logger.info(f"Storage channel: {chat.title} (ID: {config.STORAGE_CHANNEL_ID})")
+    except errors.ChatAdminRequired:
+        logger.error("Bot doesn't have access to the storage channel. Make sure it's added as admin.")
+        return
+    except errors.ChannelInvalid:
+        logger.error("Invalid storage channel ID. Make sure it starts with -100 and the bot is added.")
+        return
     except Exception as e:
         logger.error(f"Cannot access storage channel: {e}")
         return
@@ -341,14 +380,16 @@ async def main():
     logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
     
     # Keep the bot running
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.critical(f"Bot crashed: {e}")
     finally:
+        await app.stop()
         logger.info("Bot has stopped.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,469 +1,354 @@
-import asyncio
-import requests
-import base64
-import sys
+import os
 import logging
-import json
-from datetime import datetime, timedelta
-from collections import defaultdict
-from telethon import TelegramClient, events, Button
-import config
+import asyncio
+from datetime import datetime
+from typing import Dict, Any
 
-# --- Logging Setup ---
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.enums import ParseMode
+
+# Import configuration
+from config import config, Config
+
+# --- Setup Logging ---
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    level=config.LOG_LEVEL,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('BananaBot')
+logger = logging.getLogger(__name__)
 
-# --- Configuration Validation ---
+# --- Validate Configuration ---
+if not config.validate_config():
+    logger.critical("Invalid configuration. Please check your environment variables.")
+    exit(1)
+
+# --- Initialize Pyrogram Client ---
 try:
-    API_ID = config.API_ID
-    API_HASH = config.API_HASH
-    BOT_TOKEN = config.BOT_TOKEN
-    API_KEY = config.API_KEY
-    
-    # Check if placeholders are still there
-    placeholder_values = ['your_api_id_here', 'your_api_hash_here', 
-                         'your_bot_token_here', 'your_gemini_api_key_here']
-    
-    if any(val in placeholder_values for val in [API_ID, API_HASH, BOT_TOKEN, API_KEY]):
-        logger.error("❌ Please replace placeholder values in config.py with your actual API credentials!")
-        logger.error("Get credentials from:")
-        logger.error("Telegram API: https://my.telegram.org")
-        logger.error("Bot Token: @BotFather on Telegram")
-        logger.error("Gemini API: https://aistudio.google.com/")
-        sys.exit(1)
-    
-    if not all([API_ID, API_HASH, BOT_TOKEN, API_KEY]):
-        logger.error("One or more configuration variables are missing")
-        sys.exit(1)
-    
-    API_ID_INT = int(API_ID)
-    
-except (AttributeError, ValueError) as e:
-    logger.error(f"Configuration error: {e}")
-    logger.error("Please ensure config.py exists and all credentials are set correctly.")
-    sys.exit(1)
-
-# --- Initialize Telegram Client FIRST ---
-client = TelegramClient('banana_bot_session', API_ID_INT, API_HASH)
-
-# --- Global Variables ---
-MODEL_NAME = "imagen-3.0-generate-002"  # Fixed model name
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateImage?key={API_KEY}"
-user_requests = defaultdict(list)
-user_stats = defaultdict(lambda: {'requests': 0, 'successful': 0})
-user_conversations = {}  # Track active conversations
-
-# --- Rate Limiting Function ---
-def is_rate_limited(user_id):
-    """Check if user has exceeded rate limit"""
-    now = datetime.now()
-    user_requests[user_id] = [req_time for req_time in user_requests[user_id] 
-                             if now - req_time < timedelta(minutes=1)]
-    
-    if len(user_requests[user_id]) >= config.RATE_LIMIT_PER_USER:
-        return True
-    
-    user_requests[user_id].append(now)
-    return False
-
-# --- Image Generation with Correct Imagen API Format ---
-async def generate_image_with_retry(prompt, max_retries=config.MAX_RETRIES):
-    """Generates an image using the Gemini Imagen API with exponential backoff"""
-    headers = {
-        'Content-Type': 'application/json',
-    }
-    
-    # Correct payload format for Imagen generateImage endpoint
-    payload = {
-        "prompt": prompt,
-        "numberOfImages": 1,
-        "aspectRatio": "1:1",
-        "quality": "high",
-        "safetyFilterLevel": "block_most",  # Safety setting
-        "personGeneration": "allow_all",    # Allow person generation if needed
-    }
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Attempt {attempt + 1}: Generating image with prompt: {prompt}")
-            
-            response = await asyncio.to_thread(
-                requests.post, API_URL, json=payload, headers=headers, timeout=60
-            )
-            
-            logger.info(f"Response status: {response.status_code}")
-            
-            # Handle rate limiting and quota exceeded
-            if response.status_code == 429:
-                wait_time = 2 ** attempt
-                logger.warning(f"Rate limited. Waiting {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
-                continue
-                
-            # Handle quota exceeded
-            if response.status_code == 403:
-                error_msg = response.json().get('error', {}).get('message', 'Unknown error')
-                logger.error(f"Quota exceeded or access denied: {error_msg}")
-                if "quota" in error_msg.lower():
-                    await asyncio.sleep(30)  # Wait longer for quota issues
-                    continue
-                else:
-                    return None
-                    
-            response.raise_for_status()
-            result = response.json()
-            
-            logger.info(f"API response keys: {result.keys()}")
-            
-            # Check the correct response format for Imagen
-            if "images" in result and result["images"]:
-                b64_string = result["images"][0].get("bytesBase64Encoded")
-                if b64_string:
-                    logger.info("Image generated successfully")
-                    return base64.b64decode(b64_string)
-                else:
-                    logger.error("No base64 image data in response")
-            else:
-                logger.error(f"Unexpected response format: {result}")
-                
-            return None
-                
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timeout on attempt {attempt + 1}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed on attempt {attempt + 1}: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_detail = e.response.json()
-                    logger.error(f"Error details: {error_detail}")
-                except:
-                    logger.error(f"Error response text: {e.response.text}")
-        except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-            
-        # Exponential backoff
-        if attempt < max_retries - 1:
-            wait_time = 2 ** attempt
-            logger.info(f"Waiting {wait_time} seconds before retry...")
-            await asyncio.sleep(wait_time)
-    
-    logger.error("Max retries reached. Could not generate image.")
-    return None
-
-async def generate_banana_image(event, prompt):
-    """Generate and send banana image"""
-    user_id = event.sender_id
-    
-    # Rate limiting check
-    if is_rate_limited(user_id):
-        await event.respond("⏰ Too many requests! Please wait a minute before generating more bananas.")
-        return
-    
-    # Update statistics
-    user_stats[user_id]['requests'] += 1
-    
-    logger.info(f"Generating banana for user {user_id} with prompt: {prompt}")
-    
-    # Send processing message
-    processing_msg = await event.respond('🍌 Generating your banana... Please wait 20-30 seconds.')
-    
-    # Generate image
-    image_bytes = await generate_image_with_retry(prompt)
-    
-    # Delete processing message
-    try:
-        await processing_msg.delete()
-    except:
-        pass  # Ignore delete errors
-    
-    if image_bytes:
-        user_stats[user_id]['successful'] += 1
-        # Save image to file for debugging
-        try:
-            with open(f"banana_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", "wb") as f:
-                f.write(image_bytes)
-        except:
-            pass
-            
-        await event.respond(file=image_bytes, caption="🍌 Here's your fresh banana!")
-        logger.info(f"Successfully sent banana to user {user_id}")
-    else:
-        error_msg = """❌ Sorry, I couldn't generate a banana image right now. 
-
-Possible reasons:
-- API quota may be exceeded
-- The prompt might need adjustment
-- Temporary API issue
-
-Please try again in a few minutes!"""
-        await event.respond(error_msg)
-        logger.error(f"Failed to generate banana for user {user_id}")
-
-# --- Test API Connection ---
-async def test_api_connection():
-    """Test if the Gemini API is accessible"""
-    test_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    try:
-        response = await asyncio.to_thread(requests.get, test_url, timeout=10)
-        if response.status_code == 200:
-            logger.info("✅ Gemini API connection successful")
-            return True
-        else:
-            logger.error(f"❌ Gemini API connection failed: {response.status_code}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Gemini API connection error: {e}")
-        return False
-
-# --- Conversation Handler for Custom Bananas ---
-@client.on(events.NewMessage(func=lambda e: e.sender_id in user_conversations))
-async def handle_custom_response(event):
-    """Handle responses for custom banana conversations"""
-    user_id = event.sender_id
-    
-    if user_id in user_conversations:
-        prompt_type = user_conversations[user_id]
-        del user_conversations[user_id]  # Remove from conversation tracking
-        
-        if prompt_type == "custom_banana":
-            custom_prompt = f"a banana, {event.text}, high quality, realistic"
-            await generate_banana_image(event, custom_prompt)
-
-# --- Telegram Bot Handlers ---
-@client.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    """Handler for the /start command"""
-    user = await event.get_sender()
-    logger.info(f"Start command from {user.username} (ID: {user.id})")
-    
-    welcome_text = """
-🍌 **Welcome to Banana Bot!** 🍌
-
-I can generate realistic banana images using AI!
-
-**Commands:**
-/banana - Generate a fresh banana
-/custom - Generate a custom banana image
-/stats - See your usage statistics
-/help - Show this help message
-/test - Test API connection
-
-Click the buttons below to get started!
-"""
-    
-    buttons = [
-        [Button.inline("🍌 Get Banana", b"get_banana")],
-        [Button.inline("🎨 Custom Banana", b"custom_banana"), 
-         Button.inline("📊 Statistics", b"show_stats")],
-        [Button.inline("ℹ️ Help", b"show_help")]
-    ]
-    
-    await event.respond(welcome_text, buttons=buttons)
-
-@client.on(events.NewMessage(pattern='/banana'))
-async def banana_handler(event):
-    """Handler for the /banana command"""
-    prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic, high quality, photorealistic"
-    await generate_banana_image(event, prompt)
-
-@client.on(events.NewMessage(pattern='/simple'))
-async def simple_banana_handler(event):
-    """Handler for simple banana command (more likely to work)"""
-    prompt = "a yellow banana on white background"
-    await generate_banana_image(event, prompt)
-
-@client.on(events.NewMessage(pattern='/custom'))
-async def custom_handler(event):
-    """Handler for custom banana requests"""
-    user_id = event.sender_id
-    
-    # Set user in conversation mode
-    user_conversations[user_id] = "custom_banana"
-    
-    await event.respond(
-        "🍌 What kind of banana would you like? Describe it!\n\n"
-        "Examples:\n"
-        "- 'a banana wearing sunglasses'\n"
-        "- 'a banana on the beach'\n"
-        "- 'a cartoon banana dancing'\n\n"
-        "Please describe your banana now...\n"
-        "(Type /cancel to cancel)"
+    app = Client(
+        "FileStoreBot",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        bot_token=config.BOT_TOKEN,
+        parse_mode=ParseMode.MARKDOWN
     )
+    logger.info("Bot client initialized successfully")
+except Exception as e:
+    logger.critical(f"Failed to initialize Pyrogram client: {e}")
+    exit(1)
 
-@client.on(events.NewMessage(pattern='/cancel'))
-async def cancel_handler(event):
-    """Cancel ongoing conversation"""
-    user_id = event.sender_id
-    if user_id in user_conversations:
-        del user_conversations[user_id]
-        await event.respond("❌ Custom banana request cancelled.")
-    else:
-        await event.respond("ℹ️ No active conversation to cancel.")
-
-@client.on(events.NewMessage(pattern='/test'))
-async def test_handler(event):
-    """Test API connection"""
-    await event.respond("🔍 Testing API connection...")
+# --- Utility Functions ---
+class FileUtils:
+    """Utility functions for file handling"""
     
-    if await test_api_connection():
-        await event.respond("✅ API connection is working!")
-    else:
-        await event.respond("❌ API connection failed. Check your API key and quota.")
-
-@client.on(events.NewMessage(pattern='/stats'))
-async def stats_handler(event):
-    """Handler for user statistics"""
-    user_id = event.sender_id
-    stats = user_stats[user_id]
+    @staticmethod
+    def human_readable_size(size_bytes: int) -> str:
+        """Convert bytes to human readable format"""
+        if not size_bytes:
+            return "0 B"
+        
+        size_names = ["B", "KB", "MB", "GB", "TB"]
+        i = 0
+        while size_bytes >= 1024 and i < len(size_names) - 1:
+            size_bytes /= 1024.0
+            i += 1
+        return f"{size_bytes:.2f} {size_names[i]}"
     
-    success_rate = (stats['successful'] / stats['requests'] * 100) if stats['requests'] > 0 else 0
+    @staticmethod
+    def get_file_info(message: Message) -> Dict[str, Any]:
+        """Extract file information from message"""
+        file_info = {
+            "name": "Unknown",
+            "size": 0,
+            "type": "Unknown",
+            "mime_type": "",
+            "caption": message.caption or "",
+            "duration": 0,
+            "width": 0,
+            "height": 0
+        }
+        
+        if message.document:
+            file_info.update({
+                "name": message.document.file_name or "Unnamed document",
+                "size": message.document.file_size or 0,
+                "type": "Document",
+                "mime_type": message.document.mime_type or "Unknown"
+            })
+        elif message.video:
+            file_info.update({
+                "name": message.video.file_name or "Unnamed video",
+                "size": message.video.file_size or 0,
+                "type": "Video",
+                "mime_type": message.video.mime_type or "video/mp4",
+                "duration": message.video.duration or 0,
+                "width": message.video.width or 0,
+                "height": message.video.height or 0
+            })
+        elif message.audio:
+            file_info.update({
+                "name": message.audio.file_name or "Unnamed audio",
+                "size": message.audio.file_size or 0,
+                "type": "Audio",
+                "mime_type": message.audio.mime_type or "audio/mpeg",
+                "duration": message.audio.duration or 0
+            })
+        elif message.photo:
+            file_info.update({
+                "name": "Photo",
+                "size": message.photo.file_size or 0,
+                "type": "Photo",
+                "mime_type": "image/jpeg"
+            })
+        elif message.voice:
+            file_info.update({
+                "name": "Voice message",
+                "size": message.voice.file_size or 0,
+                "type": "Voice",
+                "mime_type": "audio/ogg",
+                "duration": message.voice.duration or 0
+            })
+        elif message.sticker:
+            file_info.update({
+                "name": "Sticker",
+                "size": message.sticker.file_size or 0,
+                "type": "Sticker",
+                "mime_type": "image/webp"
+            })
+        elif message.animation:
+            file_info.update({
+                "name": "Animation",
+                "size": message.animation.file_size or 0,
+                "type": "Animation",
+                "mime_type": "video/mp4",
+                "duration": message.animation.duration or 0,
+                "width": message.animation.width or 0,
+                "height": message.animation.height or 0
+            })
+        
+        return file_info
     
-    stats_text = f"""
-📊 **Your Banana Statistics**
+    @staticmethod
+    def format_file_caption(file_info: Dict[str, Any], user_mention: str) -> str:
+        """Format caption for stored files"""
+        caption = f"📁 **{file_info['name']}**\n\n"
+        caption += f"**Type:** {file_info['type']}\n"
+        caption += f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
+        
+        if file_info['mime_type']:
+            caption += f"**MIME Type:** {file_info['mime_type']}\n"
+        
+        if file_info['duration'] > 0:
+            minutes, seconds = divmod(file_info['duration'], 60)
+            caption += f"**Duration:** {minutes:02d}:{seconds:02d}\n"
+        
+        if file_info['width'] and file_info['height']:
+            caption += f"**Resolution:** {file_info['width']}x{file_info['height']}\n"
+        
+        caption += f"**Stored:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        caption += f"**Owner:** {user_mention}"
+        
+        if file_info['caption']:
+            caption += f"\n**Original Caption:** {file_info['caption']}"
+        
+        return caption
 
-🍌 Total Requests: {stats['requests']}
-✅ Successful Generations: {stats['successful']}
-🎯 Success Rate: {success_rate:.1f}%
 
-Keep generating bananas! 🍌
-"""
-    await event.respond(stats_text)
-
-@client.on(events.NewMessage(pattern='/help'))
-async def help_handler(event):
-    """Handler for help command"""
-    help_text = f"""
-🆘 **Banana Bot Help**
-
-**Commands:**
-/start - Start the bot and show welcome message
-/banana - Generate a standard banana image
-/simple - Generate a simple banana (more reliable)
-/custom - Create a custom banana with your description
-/cancel - Cancel current operation
-/stats - View your usage statistics
-/test - Test API connection
-/help - Show this help message
-
-**Rate Limits:** 
-- {config.RATE_LIMIT_PER_USER} requests per minute per user
-
-**Tips:**
-- Start with /simple to test if the API works
-- Be creative but clear with your descriptions
-- If generation fails, try a simpler prompt
-
-Enjoy your bananas! 🍌
-"""
-    await event.respond(help_text)
-
-@client.on(events.CallbackQuery)
-async def callback_handler(event):
-    """Handle button clicks"""
-    user_id = event.sender_id
-    data = event.data.decode('utf-8')
-    
-    try:
-        if data == "get_banana":
-            await event.edit("🍌 Generating your banana...")
-            prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic"
-            await generate_banana_image(event, prompt)
-        elif data == "custom_banana":
-            await event.edit("🍌 Please use the /custom command to describe your banana!")
-            # Alternatively, we can start conversation directly
-            # user_conversations[user_id] = "custom_banana"
-            # await event.respond("🍌 Please describe your custom banana...")
-        elif data == "show_stats":
-            await stats_handler(event)
-        elif data == "show_help":
-            await help_handler(event)
-    except Exception as e:
-        logger.error(f"Error in callback handler: {e}")
-        await event.respond("❌ An error occurred. Please try again.")
-    
-    await event.answer()
-
-# --- Admin Commands ---
-@client.on(events.NewMessage(pattern='/admin_stats'))
-async def admin_stats_handler(event):
-    """Admin command to view bot statistics"""
-    user_id = event.sender_id
-    
-    if user_id not in config.ADMIN_USER_IDS:
-        await event.respond("🚫 Access denied.")
+# --- Command Handlers ---
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, message: Message):
+    """Handle /start command"""
+    if message.from_user.id != config.OWNER_ID:
+        await message.reply_text("❌ Sorry, this is a private bot. You do not have permission to use it.")
+        logger.warning(f"Unauthorized access attempt by user {message.from_user.id}")
         return
+
+    welcome_text = config.WELCOME_MESSAGE.format(
+        user_name=message.from_user.first_name,
+        bot_name=config.BOT_NAME,
+        max_size=int(config.MAX_FILE_SIZE / (1024 * 1024 * 1024))
+    )
     
-    total_requests = sum(stats['requests'] for stats in user_stats.values())
-    total_successful = sum(stats['successful'] for stats in user_stats.values())
-    unique_users = len(user_stats)
+    await message.reply_text(welcome_text)
+    logger.info(f"Owner {config.OWNER_ID} started the bot.")
+
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_handler(client: Client, message: Message):
+    """Handle /help command"""
+    if message.from_user.id != config.OWNER_ID:
+        return
+
+    help_text = config.HELP_MESSAGE.format(
+        max_size=int(config.MAX_FILE_SIZE / (1024 * 1024 * 1024))
+    )
     
-    overall_success_rate = (total_successful / total_requests * 100) if total_requests > 0 else 0
+    await message.reply_text(help_text)
+
+
+@app.on_message(filters.command("stats") & filters.private)
+async def stats_handler(client: Client, message: Message):
+    """Handle /stats command"""
+    if message.from_user.id != config.OWNER_ID or not config.ENABLE_STATS:
+        return
+
+    try:
+        bot_info = config.get_bot_info()
+        stats_text = (
+            f"📊 **{config.BOT_NAME} - Statistics**\n\n"
+            f"**Storage Channel:** `{config.STORAGE_CHANNEL_ID}`\n"
+            f"**Max File Size:** {bot_info['max_file_size_gb']}GB\n"
+            f"**Supported Formats:** {', '.join(bot_info['supported_formats'])}\n"
+            f"**Owner:** {message.from_user.mention}\n"
+            f"**Bot Status:** ✅ Operational\n\n"
+            f"*Detailed analytics coming in future updates...*"
+        )
+        
+        await message.reply_text(stats_text)
+        logger.info(f"Stats requested by owner {config.OWNER_ID}")
+        
+    except Exception as e:
+        await message.reply_text(f"❌ Error getting statistics: {str(e)}")
+        logger.error(f"Error in stats handler: {e}")
+
+
+@app.on_message(filters.command("config") & filters.private & filters.user(config.OWNER_ID))
+async def config_handler(client: Client, message: Message):
+    """Show current configuration (owner only)"""
+    bot_info = config.get_bot_info()
     
-    admin_text = f"""
-👑 **Admin Statistics**
+    config_text = (
+        f"⚙️ **{config.BOT_NAME} - Configuration**\n\n"
+        f"**Environment:** {os.getenv('ENVIRONMENT', 'production')}\n"
+        f"**Owner ID:** `{config.OWNER_ID}`\n"
+        f"**Storage Channel:** `{config.STORAGE_CHANNEL_ID}`\n"
+        f"**Max File Size:** {bot_info['max_file_size_gb']}GB\n\n"
+        f"**Enabled Features:**\n"
+    )
+    
+    for feature, enabled in bot_info['features'].items():
+        config_text += f"• {feature}: {'✅' if enabled else '❌'}\n"
+    
+    await message.reply_text(config_text)
 
-👥 Unique Users: {unique_users}
-🍌 Total Requests: {total_requests}
-✅ Successful Generations: {total_successful}
-🎯 Overall Success Rate: {overall_success_rate:.1f}%
 
-**Current Model:** {MODEL_NAME}
-"""
-    await event.respond(admin_text)
+@app.on_message(config.get_supported_media_filters() & filters.private)
+async def file_handler(client: Client, message: Message):
+    """Handle incoming files"""
+    if message.from_user.id != config.OWNER_ID:
+        await message.reply_text("❌ Sorry, you are not authorized to store files.")
+        return
 
-@client.on(events.NewMessage(pattern='/myid'))
-async def get_my_id(event):
-    """Temporary command to get your user ID"""
-    user = await event.get_sender()
-    await event.respond(f"Your User ID is: `{user.id}`", parse_mode='markdown')
+    # Get file information
+    file_info = FileUtils.get_file_info(message)
+    
+    # Check file size
+    if file_info['size'] > config.MAX_FILE_SIZE:
+        await message.reply_text(
+            f"❌ File too large! Maximum size is {config.MAX_FILE_SIZE / (1024**3):.1f}GB. "
+            f"Your file is {file_info['size'] / (1024**3):.1f}GB."
+        )
+        return
 
-# --- Main Function ---
+    logger.info(f"Received {file_info['type']} from owner: {file_info['name']}")
+
+    # Show processing message
+    processing_text = (
+        f"📤 **Uploading File...**\n\n"
+        f"**Name:** {file_info['name']}\n"
+        f"**Type:** {file_info['type']}\n"
+        f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
+        f"**Status:** Processing..."
+    )
+    
+    processing_message = await message.reply_text(processing_text)
+
+    try:
+        # Format caption and store file
+        file_caption = FileUtils.format_file_caption(file_info, message.from_user.mention)
+        
+        # Forward the file to storage channel
+        forwarded_message = await message.copy(
+            config.STORAGE_CHANNEL_ID,
+            caption=file_caption
+        )
+        
+        # Create download button
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 Download File", url=forwarded_message.link)
+        ]])
+        
+        # Success message
+        success_text = (
+            f"✅ **File Stored Successfully!**\n\n"
+            f"**Name:** {file_info['name']}\n"
+            f"**Type:** {file_info['type']}\n"
+            f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
+            f"**Storage:** Private Channel\n\n"
+            f"**Download Link Ready!**"
+        )
+        
+        await processing_message.edit_text(
+            success_text, 
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+        
+        logger.info(f"File stored successfully: {file_info['name']}")
+
+    except Exception as e:
+        error_text = (
+            f"❌ **Upload Failed**\n\n"
+            f"**Error:** {str(e)}\n\n"
+            f"Please try again or check if the bot has admin rights in the storage channel."
+        )
+        await processing_message.edit_text(error_text)
+        logger.error(f"Failed to store file: {e}", exc_info=True)
+
+
+# --- Error Handler ---
+@app.on_errors()
+async def error_handler(client: Client, error: Exception, update):
+    """Global error handler"""
+    logger.error(f"Error in update: {error}", exc_info=True)
+
+
+# --- Main Execution ---
 async def main():
     """Main function to start the bot"""
-    global MODEL_NAME, API_URL
+    logger.info(f"Starting {config.BOT_NAME}...")
     
-    logger.info("Starting Banana Bot...")
-    
-    # Test API connection first
-    if not await test_api_connection():
-        logger.error("❌ Failed to connect to Gemini API. Please check your API key.")
+    # Test channel access
+    try:
+        chat = await app.get_chat(config.STORAGE_CHANNEL_ID)
+        logger.info(f"Storage channel: {chat.title} (ID: {config.STORAGE_CHANNEL_ID})")
+    except Exception as e:
+        logger.error(f"Cannot access storage channel: {e}")
         return
     
-    logger.info(f"Using model: {MODEL_NAME}")
-    logger.info(f"Using API URL: {API_URL}")
-    
     # Start the bot
-    await client.start(bot_token=BOT_TOKEN)
+    await app.start()
     
-    me = await client.get_me()
-    logger.info(f"Bot started successfully as @{me.username}")
-    logger.info("Bot is now running...")
+    # Get bot info
+    bot_info = await app.get_me()
+    logger.info(f"Bot @{bot_info.username} is now running!")
     
-    # Notify admin
-    try:
-        if config.ADMIN_USER_IDS:
-            await client.send_message(
-                config.ADMIN_USER_IDS[0],
-                "🍌 Banana Bot started successfully!"
-            )
-    except Exception as e:
-        logger.warning(f"Could not send startup message to admin: {e}")
+    # Display bot information
+    logger.info(f"Bot Name: {config.BOT_NAME}")
+    logger.info(f"Owner ID: {config.OWNER_ID}")
+    logger.info(f"Storage Channel: {config.STORAGE_CHANNEL_ID}")
+    logger.info(f"Max File Size: {config.MAX_FILE_SIZE / (1024**3)}GB")
+    logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
     
-    await client.run_until_disconnected()
+    # Keep the bot running
+    await asyncio.Event().wait()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.critical(f"Bot crashed: {e}")
     finally:
-        logger.info("Bot shutdown complete")
+        logger.info("Bot has stopped.")

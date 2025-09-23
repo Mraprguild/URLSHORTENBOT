@@ -2,129 +2,347 @@ import asyncio
 import requests
 import base64
 import sys
-from telethon import TelegramClient, events
-import config  # Import configuration from config.py
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from telethon import TelegramClient, events, Button
+import config
 
-# --- Configuration Loading and Validation ---
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('BananaBot')
+
+# --- Configuration Validation ---
 try:
     API_ID = config.API_ID
     API_HASH = config.API_HASH
     BOT_TOKEN = config.BOT_TOKEN
-    API_KEY = config.API_KEY # Load Gemini API Key from config
-
-    # Check if the values are actually filled in
+    API_KEY = config.API_KEY
+    
     if not all([API_ID, API_HASH, BOT_TOKEN, API_KEY]):
-        print("ERROR: One or more configuration variables are missing in config.py.")
-        print("Please fill in API_ID, API_HASH, BOT_TOKEN, and API_KEY.")
+        logger.error("One or more configuration variables are missing")
         sys.exit(1)
-
-    # Safely convert API_ID to integer
+    
     API_ID_INT = int(API_ID)
-
+    
 except (AttributeError, ValueError) as e:
-    print(f"ERROR: config.py is missing or a value is incorrect: {e}")
-    print("Please ensure config.py exists and all credentials are set correctly.")
+    logger.error(f"Configuration error: {e}")
     sys.exit(1)
-# -----------------------------------------
 
-# Initialize the Telegram client
-client = TelegramClient('bot_session', API_ID_INT, API_HASH)
-
-# Gemini API configuration (loaded from config)
+# --- Global Variables ---
 MODEL_NAME = None
 API_URL = None
+user_requests = defaultdict(list)
+user_stats = defaultdict(lambda: {'requests': 0, 'successful': 0})
 
+# --- Rate Limiting Function ---
+def is_rate_limited(user_id):
+    """Check if user has exceeded rate limit"""
+    now = datetime.now()
+    user_requests[user_id] = [req_time for req_time in user_requests[user_id] 
+                             if now - req_time < timedelta(minutes=1)]
+    
+    if len(user_requests[user_id]) >= config.RATE_LIMIT_PER_USER:
+        return True
+    
+    user_requests[user_id].append(now)
+    return False
+
+# --- Model Detection ---
 async def get_latest_image_model():
-    """Fetches the latest available image generation model from the Gemini API."""
+    """Fetches the latest available image generation model"""
     list_models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     fallback_model = "imagen-3.0-generate-002"
+    
     try:
-        response = await asyncio.to_thread(requests.get, list_models_url)
+        response = await asyncio.to_thread(requests.get, list_models_url, timeout=10)
         response.raise_for_status()
         models = response.json().get("models", [])
         
         imagen_models = [
             m for m in models 
-            if "imagen" in m.get("name", "") and 
-               "predict" in m.get("supportedGenerationMethods", [])
+            if "imagen" in m.get("name", "").lower() and 
+               "generate" in m.get("supportedGenerationMethods", [])
         ]
         
         if imagen_models:
             latest_model = sorted(imagen_models, key=lambda x: x['name'], reverse=True)[0]
             model_name = latest_model["name"].split('/')[-1]
-            print(f"Auto-detected image model: {model_name}")
+            logger.info(f"Auto-detected image model: {model_name}")
             return model_name
         
-        print(f"Could not auto-detect image model. Falling back to {fallback_model}.")
+        logger.warning(f"Could not auto-detect image model. Using fallback: {fallback_model}")
         return fallback_model
-    except (requests.exceptions.RequestException, KeyError) as e:
-        print(f"Failed to fetch models: {e}. Falling back to {fallback_model}.")
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch models: {e}. Using fallback: {fallback_model}")
         return fallback_model
 
-async def generate_image_with_retry(prompt, max_retries=3):
-    """Generates an image using the Gemini API with exponential backoff."""
+# --- Image Generation ---
+async def generate_image_with_retry(prompt, max_retries=config.MAX_RETRIES):
+    """Generates an image using the Gemini API with exponential backoff"""
     headers = {'Content-Type': 'application/json'}
     payload = {
         "instances": [{"prompt": prompt}],
-        "parameters": {"sampleCount": 1}
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "1:1",
+            "quality": "high"
+        }
     }
+    
     for attempt in range(max_retries):
         try:
             response = await asyncio.to_thread(
-                requests.post, API_URL, json=payload, headers=headers
+                requests.post, API_URL, json=payload, headers=headers, timeout=30
             )
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                wait_time = 2 ** attempt
+                logger.warning(f"Rate limited. Waiting {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+                continue
+                
             response.raise_for_status()
             result = response.json()
 
             if "predictions" in result and result["predictions"]:
                 b64_string = result["predictions"][0].get("bytesBase64Encoded")
                 if b64_string:
+                    logger.info("Image generated successfully")
                     return base64.b64decode(b64_string)
-            return None
-        except requests.exceptions.RequestException as e:
-            print(f"API request failed on attempt {attempt + 1}: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error("No image data in response")
+                    return None
             else:
-                print("Max retries reached. Could not generate image.")
+                logger.error(f"Unexpected response format: {result}")
                 return None
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout on attempt {attempt + 1}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+            
+        # Exponential backoff
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt
+            await asyncio.sleep(wait_time)
+    
+    logger.error("Max retries reached. Could not generate image.")
+    return None
 
+# --- Telegram Bot Handlers ---
 @client.on(events.NewMessage(pattern='/start'))
-async def start(event):
-    """Handler for the /start command."""
-    await event.respond('Hello! I am a banana bot.\nSend /banana to get a fresh banana image!')
+async def start_handler(event):
+    """Handler for the /start command"""
+    user = await event.get_sender()
+    logger.info(f"Start command from {user.username} (ID: {user.id})")
+    
+    welcome_text = """
+🍌 **Welcome to Banana Bot!** 🍌
+
+I can generate realistic banana images using AI!
+
+**Commands:**
+/banana - Generate a fresh banana
+/custom - Generate a custom banana image
+/stats - See your usage statistics
+/help - Show this help message
+
+Click the buttons below to get started!
+"""
+    
+    buttons = [
+        [Button.inline("🍌 Get Banana", b"get_banana")],
+        [Button.inline("🎨 Custom Banana", b"custom_banana"), 
+         Button.inline("📊 Statistics", b"show_stats")],
+        [Button.inline("ℹ️ Help", b"show_help")]
+    ]
+    
+    await event.respond(welcome_text, buttons=buttons)
 
 @client.on(events.NewMessage(pattern='/banana'))
-async def banana(event):
-    """Handler for the /banana command."""
-    sender = await event.get_sender()
-    print(f"Received /banana command from {sender.username}")
+async def banana_handler(event):
+    """Handler for the /banana command"""
+    await generate_banana_image(event, "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic")
 
-    processing_message = await event.respond('🍌 Generating a banana for you... Please wait.')
+@client.on(events.NewMessage(pattern='/custom'))
+async def custom_handler(event):
+    """Handler for custom banana requests"""
+    async with client.conversation(event.chat_id) as conv:
+        await conv.send_message("🍌 What kind of banana would you like? Describe it!\n\nExamples:\n- 'a banana wearing sunglasses'\n- 'a banana on the beach'\n- 'a cartoon banana dancing'")
+        
+        try:
+            response = await conv.get_response(timeout=60)
+            custom_prompt = f"a banana, {response.text}, realistic style"
+            await generate_banana_image(event, custom_prompt)
+        except asyncio.TimeoutError:
+            await event.respond("⏰ Sorry, you took too long to respond. Please try again!")
 
-    prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic"
+@client.on(events.NewMessage(pattern='/stats'))
+async def stats_handler(event):
+    """Handler for user statistics"""
+    user_id = event.sender_id
+    stats = user_stats[user_id]
+    
+    stats_text = f"""
+📊 **Your Banana Statistics**
+
+🍌 Total Requests: {stats['requests']}
+✅ Successful Generations: {stats['successful']}
+🎯 Success Rate: {(stats['successful']/stats['requests']*100) if stats['requests'] > 0 else 0:.1f}%
+
+Keep generating bananas! 🍌
+"""
+    await event.respond(stats_text)
+
+@client.on(events.NewMessage(pattern='/help'))
+async def help_handler(event):
+    """Handler for help command"""
+    help_text = """
+🆘 **Banana Bot Help**
+
+**Commands:**
+/start - Start the bot and show welcome message
+/banana - Generate a standard banana image
+/custom - Create a custom banana with your description
+/stats - View your usage statistics
+/help - Show this help message
+
+**Rate Limits:** 
+- {config.RATE_LIMIT_PER_USER} requests per minute per user
+
+**Tips:**
+- Be creative with your custom banana descriptions!
+- The bot works best with clear, descriptive prompts
+- If generation fails, try again with a simpler description
+
+Enjoy your bananas! 🍌
+"""
+    await event.respond(help_text)
+
+@client.on(events.CallbackQuery)
+async def callback_handler(event):
+    """Handle button clicks"""
+    user_id = event.sender_id
+    data = event.data.decode('utf-8')
+    
+    if data == "get_banana":
+        await generate_banana_image(event, "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic")
+    elif data == "custom_banana":
+        await custom_handler(event)
+    elif data == "show_stats":
+        await stats_handler(event)
+    elif data == "show_help":
+        await help_handler(event)
+    
+    await event.answer()
+
+async def generate_banana_image(event, prompt):
+    """Generate and send banana image"""
+    user_id = event.sender_id
+    
+    # Rate limiting check
+    if is_rate_limited(user_id):
+        await event.respond("⏰ Too many requests! Please wait a minute before generating more bananas.")
+        return
+    
+    # Update statistics
+    user_stats[user_id]['requests'] += 1
+    
+    logger.info(f"Generating banana for user {user_id} with prompt: {prompt}")
+    
+    # Send processing message
+    processing_msg = await event.respond('🍌 Generating your banana... Please wait 10-20 seconds.')
+    
+    # Generate image
     image_bytes = await generate_image_with_retry(prompt)
-
-    await client.delete_messages(event.chat_id, [processing_message.id])
-
+    
+    # Delete processing message
+    await processing_msg.delete()
+    
     if image_bytes:
-        print("Image generated successfully. Sending to user.")
-        await client.send_file(event.chat_id, image_bytes, caption="Here is your banana!")
+        user_stats[user_id]['successful'] += 1
+        await event.respond(file=image_bytes, caption="🍌 Here's your fresh banana!")
+        logger.info(f"Successfully sent banana to user {user_id}")
     else:
-        print("Failed to generate image.")
-        await event.respond("Sorry, I couldn't generate a banana image right now. Please try again later.")
+        await event.respond("❌ Sorry, I couldn't generate a banana image right now. Please try again later.")
+        logger.error(f"Failed to generate banana for user {user_id}")
 
+# --- Admin Commands ---
+@client.on(events.NewMessage(pattern='/admin_stats'))
+async def admin_stats_handler(event):
+    """Admin command to view bot statistics"""
+    user_id = event.sender_id
+    
+    if user_id not in config.ADMIN_USER_IDS:
+        await event.respond("🚫 Access denied.")
+        return
+    
+    total_requests = sum(stats['requests'] for stats in user_stats.values())
+    total_successful = sum(stats['successful'] for stats in user_stats.values())
+    unique_users = len(user_stats)
+    
+    admin_text = f"""
+👑 **Admin Statistics**
+
+👥 Unique Users: {unique_users}
+🍌 Total Requests: {total_requests}
+✅ Successful Generations: {total_successful}
+🎯 Overall Success Rate: {(total_successful/total_requests*100) if total_requests > 0 else 0:.1f}%
+
+**Current Model:** {MODEL_NAME}
+"""
+    await event.respond(admin_text)
+
+# --- Main Function ---
 async def main():
-    """Main function to start the bot."""
+    """Main function to start the bot"""
     global MODEL_NAME, API_URL
-
+    
+    logger.info("Starting Banana Bot...")
+    
+    # Detect latest model
     MODEL_NAME = await get_latest_image_model()
     API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:predict?key={API_KEY}"
-
-    print("Starting bot...")
+    
+    logger.info(f"Using API URL: {API_URL}")
+    
+    # Start the bot
     await client.start(bot_token=BOT_TOKEN)
-    print("Bot started successfully!")
+    
+    me = await client.get_me()
+    logger.info(f"Bot started successfully as @{me.username}")
+    logger.info("Bot is now running...")
+    
+    # Set bot commands for better UX
+    await client.send_message(
+        '@BotFather',
+        '/setcommands',
+        buttons=[Button.inline("Select bot", b"select_bot")]
+    )
+    
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Initialize Telegram client
+    client = TelegramClient('banana_bot_session', API_ID_INT, API_HASH)
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    finally:
+        logger.info("Bot shutdown complete")

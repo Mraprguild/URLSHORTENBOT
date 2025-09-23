@@ -2,7 +2,11 @@ import asyncio
 import requests
 import base64
 from telethon import TelegramClient, events
+from dotenv import load_dotenv
 import config  # Import configuration from config.py
+
+# Load environment variables
+load_dotenv()
 
 # Load credentials from config.py
 API_ID = config.API_ID

@@ -170,3 +170,33 @@ def get_config(env: str = os.getenv("ENVIRONMENT", "production")) -> Config:
 
 # Global config instance
 config = get_config()
+# In config.py, update the get_supported_media_filters method:
+
+@classmethod
+def get_supported_media_filters(cls):
+    """Get Pyrogram filters for supported media types"""
+    from pyrogram import filters
+    
+    # Create individual filters for each supported media type
+    media_filters = []
+    
+    if "document" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.document)
+    if "video" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.video)
+    if "audio" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.audio)
+    if "photo" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.photo)
+    if "voice" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.voice)
+    if "sticker" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.sticker)
+    if "animation" in cls.SUPPORTED_FORMATS:
+        media_filters.append(filters.animation)
+    
+    # Combine all filters with OR logic
+    if media_filters:
+        return filters.create(lambda _, __, m: any(f(m) for f in media_filters))
+    else:
+        return filters.create(lambda _, __, m: False)

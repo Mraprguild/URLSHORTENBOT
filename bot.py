@@ -8,15 +8,12 @@ import config  # Import configuration from config.py
 API_ID = config.API_ID
 API_HASH = config.API_HASH
 BOT_TOKEN = config.BOT_TOKEN
+API_KEY = config.API_KEY
+MODEL_NAME = None 
+API_URL = None
 
 # Initialize the Telegram client
 client = TelegramClient('bot_session', int(API_ID) if API_ID else None, API_HASH)
-
-# Gemini API configuration
-# NOTE: An empty API key is used here, as it will be provided by the execution environment.
-API_KEY = ""
-MODEL_NAME = None # Will be set dynamically
-API_URL = None # Will be set dynamically
 
 async def get_latest_image_model():
     """Fetches the latest available image generation model from the Gemini API."""

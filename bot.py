@@ -3,6 +3,7 @@ import requests
 import base64
 import sys
 import logging
+import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 from telethon import TelegramClient, events, Button
@@ -53,8 +54,8 @@ except (AttributeError, ValueError) as e:
 client = TelegramClient('banana_bot_session', API_ID_INT, API_HASH)
 
 # --- Global Variables ---
-MODEL_NAME = None
-API_URL = None
+MODEL_NAME = "imagen-3.0-generate-002"  # Fixed model name
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateImage?key={API_KEY}"
 user_requests = defaultdict(list)
 user_stats = defaultdict(lambda: {'requests': 0, 'successful': 0})
 
@@ -71,87 +72,85 @@ def is_rate_limited(user_id):
     user_requests[user_id].append(now)
     return False
 
-# --- Model Detection ---
-async def get_latest_image_model():
-    """Fetches the latest available image generation model"""
-    list_models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    fallback_model = "imagen-3.0-generate-002"
-    
-    try:
-        response = await asyncio.to_thread(requests.get, list_models_url, timeout=10)
-        response.raise_for_status()
-        models = response.json().get("models", [])
-        
-        imagen_models = [
-            m for m in models 
-            if "imagen" in m.get("name", "").lower() and 
-               "generate" in m.get("supportedGenerationMethods", [])
-        ]
-        
-        if imagen_models:
-            latest_model = sorted(imagen_models, key=lambda x: x['name'], reverse=True)[0]
-            model_name = latest_model["name"].split('/')[-1]
-            logger.info(f"Auto-detected image model: {model_name}")
-            return model_name
-        
-        logger.warning(f"Could not auto-detect image model. Using fallback: {fallback_model}")
-        return fallback_model
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch models: {e}. Using fallback: {fallback_model}")
-        return fallback_model
-
-# --- Image Generation ---
+# --- Image Generation with Correct Imagen API Format ---
 async def generate_image_with_retry(prompt, max_retries=config.MAX_RETRIES):
-    """Generates an image using the Gemini API with exponential backoff"""
-    headers = {'Content-Type': 'application/json'}
+    """Generates an image using the Gemini Imagen API with exponential backoff"""
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    
+    # Correct payload format for Imagen generateImage endpoint
     payload = {
-        "instances": [{"prompt": prompt}],
-        "parameters": {
-            "sampleCount": 1,
-            "aspectRatio": "1:1",
-            "quality": "high"
-        }
+        "prompt": prompt,
+        "numberOfImages": 1,
+        "aspectRatio": "1:1",
+        "quality": "high",
+        "safetyFilterLevel": "block_most",  # Safety setting
+        "personGeneration": "allow_all",    # Allow person generation if needed
     }
     
     for attempt in range(max_retries):
         try:
+            logger.info(f"Attempt {attempt + 1}: Generating image with prompt: {prompt}")
+            
             response = await asyncio.to_thread(
-                requests.post, API_URL, json=payload, headers=headers, timeout=30
+                requests.post, API_URL, json=payload, headers=headers, timeout=60
             )
             
-            # Handle rate limiting
+            logger.info(f"Response status: {response.status_code}")
+            
+            # Handle rate limiting and quota exceeded
             if response.status_code == 429:
                 wait_time = 2 ** attempt
                 logger.warning(f"Rate limited. Waiting {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
                 continue
                 
+            # Handle quota exceeded
+            if response.status_code == 403:
+                error_msg = response.json().get('error', {}).get('message', 'Unknown error')
+                logger.error(f"Quota exceeded or access denied: {error_msg}")
+                if "quota" in error_msg.lower():
+                    await asyncio.sleep(30)  # Wait longer for quota issues
+                    continue
+                else:
+                    return None
+                    
             response.raise_for_status()
             result = response.json()
-
-            if "predictions" in result and result["predictions"]:
-                b64_string = result["predictions"][0].get("bytesBase64Encoded")
+            
+            logger.info(f"API response keys: {result.keys()}")
+            
+            # Check the correct response format for Imagen
+            if "images" in result and result["images"]:
+                b64_string = result["images"][0].get("bytesBase64Encoded")
                 if b64_string:
                     logger.info("Image generated successfully")
                     return base64.b64decode(b64_string)
                 else:
-                    logger.error("No image data in response")
-                    return None
+                    logger.error("No base64 image data in response")
             else:
                 logger.error(f"Unexpected response format: {result}")
-                return None
+                
+            return None
                 
         except requests.exceptions.Timeout:
             logger.warning(f"Request timeout on attempt {attempt + 1}")
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed on attempt {attempt + 1}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_detail = e.response.json()
+                    logger.error(f"Error details: {error_detail}")
+                except:
+                    logger.error(f"Error response text: {e.response.text}")
         except Exception as e:
             logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
             
         # Exponential backoff
         if attempt < max_retries - 1:
             wait_time = 2 ** attempt
+            logger.info(f"Waiting {wait_time} seconds before retry...")
             await asyncio.sleep(wait_time)
     
     logger.error("Max retries reached. Could not generate image.")
@@ -172,21 +171,55 @@ async def generate_banana_image(event, prompt):
     logger.info(f"Generating banana for user {user_id} with prompt: {prompt}")
     
     # Send processing message
-    processing_msg = await event.respond('🍌 Generating your banana... Please wait 10-20 seconds.')
+    processing_msg = await event.respond('🍌 Generating your banana... Please wait 20-30 seconds.')
     
     # Generate image
     image_bytes = await generate_image_with_retry(prompt)
     
     # Delete processing message
-    await processing_msg.delete()
+    try:
+        await processing_msg.delete()
+    except:
+        pass  # Ignore delete errors
     
     if image_bytes:
         user_stats[user_id]['successful'] += 1
+        # Save image to file for debugging
+        try:
+            with open(f"banana_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", "wb") as f:
+                f.write(image_bytes)
+        except:
+            pass
+            
         await event.respond(file=image_bytes, caption="🍌 Here's your fresh banana!")
         logger.info(f"Successfully sent banana to user {user_id}")
     else:
-        await event.respond("❌ Sorry, I couldn't generate a banana image right now. Please try again later.")
+        error_msg = """❌ Sorry, I couldn't generate a banana image right now. 
+
+Possible reasons:
+- API quota may be exceeded
+- The prompt might need adjustment
+- Temporary API issue
+
+Please try again in a few minutes!"""
+        await event.respond(error_msg)
         logger.error(f"Failed to generate banana for user {user_id}")
+
+# --- Test API Connection ---
+async def test_api_connection():
+    """Test if the Gemini API is accessible"""
+    test_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+    try:
+        response = await asyncio.to_thread(requests.get, test_url, timeout=10)
+        if response.status_code == 200:
+            logger.info("✅ Gemini API connection successful")
+            return True
+        else:
+            logger.error(f"❌ Gemini API connection failed: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Gemini API connection error: {e}")
+        return False
 
 # --- Telegram Bot Handlers ---
 @client.on(events.NewMessage(pattern='/start'))
@@ -205,6 +238,7 @@ I can generate realistic banana images using AI!
 /custom - Generate a custom banana image
 /stats - See your usage statistics
 /help - Show this help message
+/test - Test API connection
 
 Click the buttons below to get started!
 """
@@ -221,7 +255,14 @@ Click the buttons below to get started!
 @client.on(events.NewMessage(pattern='/banana'))
 async def banana_handler(event):
     """Handler for the /banana command"""
-    await generate_banana_image(event, "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic")
+    prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic, high quality, photorealistic"
+    await generate_banana_image(event, prompt)
+
+@client.on(events.NewMessage(pattern='/simple'))
+async def simple_banana_handler(event):
+    """Handler for simple banana command (more likely to work)"""
+    prompt = "a yellow banana on white background"
+    await generate_banana_image(event, prompt)
 
 @client.on(events.NewMessage(pattern='/custom'))
 async def custom_handler(event):
@@ -234,10 +275,20 @@ async def custom_handler(event):
             events.NewMessage(chats=event.chat_id, from_users=event.sender_id),
             timeout=60
         )
-        custom_prompt = f"a banana, {response.text}, realistic style"
+        custom_prompt = f"a banana, {response.text}, high quality, realistic"
         await generate_banana_image(event, custom_prompt)
     except asyncio.TimeoutError:
         await event.respond("⏰ Sorry, you took too long to respond. Please try again!")
+
+@client.on(events.NewMessage(pattern='/test'))
+async def test_handler(event):
+    """Test API connection"""
+    await event.respond("🔍 Testing API connection...")
+    
+    if await test_api_connection():
+        await event.respond("✅ API connection is working!")
+    else:
+        await event.respond("❌ API connection failed. Check your API key and quota.")
 
 @client.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
@@ -267,17 +318,19 @@ async def help_handler(event):
 **Commands:**
 /start - Start the bot and show welcome message
 /banana - Generate a standard banana image
+/simple - Generate a simple banana (more reliable)
 /custom - Create a custom banana with your description
 /stats - View your usage statistics
+/test - Test API connection
 /help - Show this help message
 
 **Rate Limits:** 
 - {config.RATE_LIMIT_PER_USER} requests per minute per user
 
 **Tips:**
-- Be creative with your custom banana descriptions!
-- The bot works best with clear, descriptive prompts
-- If generation fails, try again with a simpler description
+- Start with /simple to test if the API works
+- Be creative but clear with your descriptions
+- If generation fails, try a simpler prompt
 
 Enjoy your bananas! 🍌
 """
@@ -289,17 +342,21 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = event.data.decode('utf-8')
     
-    if data == "get_banana":
-        # Edit the original message to show we're processing
-        await event.edit("🍌 Generating your banana...")
-        await generate_banana_image(event, "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic")
-    elif data == "custom_banana":
-        await event.edit("🍌 Please describe your custom banana...")
-        await custom_handler(event)
-    elif data == "show_stats":
-        await stats_handler(event)
-    elif data == "show_help":
-        await help_handler(event)
+    try:
+        if data == "get_banana":
+            await event.edit("🍌 Generating your banana...")
+            prompt = "a single, ripe, yellow banana on a clean white background, studio lighting, hyperrealistic"
+            await generate_banana_image(event, prompt)
+        elif data == "custom_banana":
+            await event.edit("🍌 Please describe your custom banana...")
+            await custom_handler(event)
+        elif data == "show_stats":
+            await stats_handler(event)
+        elif data == "show_help":
+            await help_handler(event)
+    except Exception as e:
+        logger.error(f"Error in callback handler: {e}")
+        await event.respond("❌ An error occurred. Please try again.")
     
     await event.answer()
 
@@ -344,10 +401,12 @@ async def main():
     
     logger.info("Starting Banana Bot...")
     
-    # Detect latest model
-    MODEL_NAME = await get_latest_image_model()
-    API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:predict?key={API_KEY}"
+    # Test API connection first
+    if not await test_api_connection():
+        logger.error("❌ Failed to connect to Gemini API. Please check your API key.")
+        return
     
+    logger.info(f"Using model: {MODEL_NAME}")
     logger.info(f"Using API URL: {API_URL}")
     
     # Start the bot
@@ -357,11 +416,14 @@ async def main():
     logger.info(f"Bot started successfully as @{me.username}")
     logger.info("Bot is now running...")
     
-    # Bot is ready
-    await client.send_message(
-        config.ADMIN_USER_IDS[0],
-        "🍌 Banana Bot started successfully!"
-    )
+    # Notify admin
+    try:
+        await client.send_message(
+            config.ADMIN_USER_IDS[0],
+            "🍌 Banana Bot started successfully!"
+        )
+    except:
+        logger.warning("Could not send startup message to admin")
     
     await client.run_until_disconnected()
 

@@ -3,7 +3,6 @@ import requests
 import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
-from telegram.error import TelegramError
 
 import config
 
@@ -26,29 +25,21 @@ class URLShortenerBot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
         
-        # Add error handler - FIX FOR THE ERROR
+        # Add error handler
         self.application.add_error_handler(self.error_handler)
     
     def is_valid_url(self, url: str) -> bool:
         """Enhanced URL validation"""
-        pattern = re.compile(
-            r'^https?://'  # http:// or https://
-            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
-            r'localhost|'  # localhost...
-            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-            r'(?::\d+)?'  # optional port
-            r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-        return re.match(pattern, url) is not None
-
+        # Simple validation for now - you can enhance this
+        return url.startswith(('http://', 'https://'))
+    
     async def error_handler(self, update: Update, context: CallbackContext):
         """Handle errors in the telegram bot"""
         logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
         
-        # Try to send a message to the user about the error
         try:
             if update and update.effective_message:
-                error_message = "❌ An error occurred while processing your request. Please try again."
-                await update.effective_message.reply_text(error_message)
+                await update.effective_message.reply_text("❌ An error occurred. Please try again.")
         except Exception as e:
             logger.error(f"Error while sending error message: {e}")
 
@@ -59,14 +50,24 @@ class URLShortenerBot:
             if not self.is_valid_url(url):
                 return None
 
-            if service == 'bitly' and config.BITLY_TOKEN:
+            logger.info(f"Shortening URL with {service}: {url}")
+
+            if service == 'bitly':
+                if not config.BITLY_TOKEN:
+                    logger.error("Bitly token not configured")
+                    return None
+                
                 headers = {
                     'Authorization': f'Bearer {config.BITLY_TOKEN}',
                     'Content-Type': 'application/json'
                 }
                 data = {'long_url': url}
-                response = requests.post(config.SUPPORTED_SERVICES['bitly']['api_url'], 
-                                       headers=headers, json=data, timeout=10)
+                response = requests.post(
+                    config.SUPPORTED_SERVICES[service]['api_url'], 
+                    headers=headers, 
+                    json=data, 
+                    timeout=10
+                )
                 if response.status_code == 200:
                     return response.json()['link']
                 else:
@@ -74,45 +75,63 @@ class URLShortenerBot:
             
             elif service == 'tinyurl':
                 params = {'url': url}
-                response = requests.get(config.SUPPORTED_SERVICES['tinyurl']['api_url'], 
-                                      params=params, timeout=10)
+                response = requests.get(
+                    config.SUPPORTED_SERVICES[service]['api_url'], 
+                    params=params, 
+                    timeout=10
+                )
                 if response.status_code == 200:
                     return response.text.strip()
             
-            elif service == 'cuttly' and config.CUTTLY_API:
+            elif service == 'cuttly':
+                if not config.CUTTLY_API:
+                    logger.error("Cuttly API key not configured")
+                    return None
+                
                 params = {'key': config.CUTTLY_API, 'short': url}
-                response = requests.get(config.SUPPORTED_SERVICES['cuttly']['api_url'], 
-                                      params=params, timeout=10)
+                response = requests.get(
+                    config.SUPPORTED_SERVICES[service]['api_url'], 
+                    params=params, 
+                    timeout=10
+                )
                 if response.status_code == 200:
                     data = response.json()
-                    if data['url']['status'] == 7:
+                    if data.get('url', {}).get('status') == 7:
                         return data['url']['shortLink']
                     else:
-                        logger.error(f"Cuttly API error: {data.get('url', {}).get('status')}")
+                        logger.error(f"Cuttly API error: {data}")
             
-            elif service == 'gplinks' and config.GPLINKS_API:
+            elif service == 'gplinks':
+                if not config.GPLINKS_API:
+                    logger.error("GPLinks API key not configured")
+                    return None
+                
                 headers = {
                     'Content-Type': 'application/x-www-form-urlencoded',
-                    'Accept': 'application/json'
                 }
                 data = {
                     'api': config.GPLINKS_API,
                     'url': url
                 }
-                response = requests.post(config.SUPPORTED_SERVICES['gplinks']['api_url'], 
-                                       data=data, headers=headers, timeout=10)
+                response = requests.post(
+                    config.SUPPORTED_SERVICES[service]['api_url'], 
+                    data=data, 
+                    headers=headers, 
+                    timeout=10
+                )
                 
                 if response.status_code == 200:
                     try:
                         result = response.json()
-                        if result.get('status') == 'success' or 'shortenedUrl' in result:
-                            return result.get('shortenedUrl') or result.get('shorturl')
-                        elif 'error' in result:
-                            logger.error(f"GPLinks API error: {result.get('error')}")
+                        if result.get('status') == 'success':
+                            return result.get('shortenedUrl', result.get('shortenedURL', result.get('shorturl')))
                     except ValueError:
-                        return response.text.strip()
+                        # If response is plain text
+                        if 'http' in response.text:
+                            return response.text.strip()
             
             return None
+            
         except requests.exceptions.Timeout:
             logger.error(f"Timeout while shortening URL with {service}")
             return None
@@ -196,7 +215,7 @@ TinyURL works without any API key!
             url = update.message.text
             
             # Basic URL validation
-            if not (url.startswith('http://') or url.startswith('https://')):
+            if not self.is_valid_url(url):
                 await update.message.reply_text("Please send a valid URL starting with http:// or https://")
                 return
             
@@ -216,7 +235,7 @@ TinyURL works without any API key!
             # Show typing action
             await update.message.reply_chat_action(action="typing")
             
-            # URL encoding for callback data (Telegram has limits on callback data length)
+            # URL encoding for callback data
             encoded_url = url.replace('/', '_').replace(':', '|')
             
             # Create keyboard with service options
@@ -250,16 +269,20 @@ TinyURL works without any API key!
             
             data = query.data
             if data.startswith('shorten_'):
-                _, service, encoded_url = data.split('_', 2)
-                url = encoded_url.replace('_', '/').replace('|', ':')  # Reverse URL encoding
-                
-                # Show typing action
-                await query.message.reply_chat_action(action="typing")
-                
-                if service == 'all':
-                    await self.send_all_shortened_urls(query, url)
+                parts = data.split('_', 2)
+                if len(parts) == 3:
+                    _, service, encoded_url = parts
+                    url = encoded_url.replace('_', '/').replace('|', ':')  # Reverse URL encoding
+                    
+                    # Show typing action
+                    await query.message.reply_chat_action(action="typing")
+                    
+                    if service == 'all':
+                        await self.send_all_shortened_urls(query, url)
+                    else:
+                        await self.send_single_shortened_url(query, url, service)
                 else:
-                    await self.send_single_shortened_url(query, url, service)
+                    await query.edit_message_text("❌ Invalid request. Please try again.")
         except Exception as e:
             logger.error(f"Error in button handler: {e}")
             try:
@@ -270,10 +293,13 @@ TinyURL works without any API key!
     async def send_single_shortened_url(self, query, url: str, service: str):
         """Send shortened URL from a single service"""
         try:
+            # Get service name safely
+            service_info = config.SUPPORTED_SERVICES.get(service, {})
+            service_name = service_info.get('name', service.capitalize())
+            
             shortened_url = self.shorten_url(url, service)
             
             if shortened_url:
-                service_name = config.SUPPORTED_SERVICES[service]['name']
                 message = f"✅ **{service_name}**\n🔗 {shortened_url}"
                 
                 # Add special note for GPLinks
@@ -286,9 +312,9 @@ TinyURL works without any API key!
                     parse_mode='Markdown'
                 )
             else:
-                service_name = config.SUPPORTED_SERVICES[service]['name']
+                requires_key = service_info.get('requires_key', True)
                 error_msg = f"❌ Failed to shorten URL using {service_name}."
-                if config.SUPPORTED_SERVICES[service]['requires_key']:
+                if requires_key:
                     error_msg += " API key might not be configured."
                 else:
                     error_msg += " Service might be temporarily unavailable."
@@ -304,25 +330,26 @@ TinyURL works without any API key!
             message = "🔗 **Shortened URLs**\n\n"
             successful_shortens = 0
             
-            for service in config.SUPPORTED_SERVICES:
-                shortened_url = self.shorten_url(url, service)
-                service_name = config.SUPPORTED_SERVICES[service]['name']
+            for service_key, service_info in config.SUPPORTED_SERVICES.items():
+                service_name = service_info.get('name', service_key.capitalize())
+                shortened_url = self.shorten_url(url, service_key)
                 
                 if shortened_url:
                     message += f"✅ **{service_name}**\n{shortened_url}"
-                    if service == 'gplinks':
+                    if service_key == 'gplinks':
                         message += " 💰"
                     message += "\n\n"
                     successful_shortens += 1
                 else:
-                    reason = "API key not configured" if config.SUPPORTED_SERVICES[service]['requires_key'] else "Service unavailable"
+                    requires_key = service_info.get('requires_key', True)
+                    reason = "API key not configured" if requires_key else "Service unavailable"
                     message += f"❌ **{service_name}** - {reason}\n\n"
             
             if successful_shortens == 0:
-                message = "❌ All services failed to shorten the URL. Please try again later or check API key configurations.\n\n💡 **Tip:** TinyURL works without API key setup!"
+                message = "❌ All services failed to shorten the URL. Please try again later.\n\n💡 **Tip:** TinyURL works without API key setup!"
             else:
                 message += f"\n✅ **{successful_shortens} out of {len(config.SUPPORTED_SERVICES)} services successful**"
-                if any(service in message for service in ['GPLinks']):
+                if successful_shortens > 0:
                     message += "\n💰 *GPLinks links can generate revenue!*"
             
             await query.edit_message_text(
@@ -343,6 +370,11 @@ def main():
     try:
         if not config.BOT_TOKEN or config.BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
             print("Error: Please set your BOT_TOKEN in environment variables or .env file")
+            return
+        
+        # Check if config has SUPPORTED_SERVICES
+        if not hasattr(config, 'SUPPORTED_SERVICES') or not config.SUPPORTED_SERVICES:
+            print("Error: SUPPORTED_SERVICES not configured in config.py")
             return
         
         bot = URLShortenerBot(config.BOT_TOKEN)

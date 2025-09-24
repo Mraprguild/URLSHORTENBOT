@@ -22,7 +22,7 @@ class Config:
     USE_WEBHOOK = os.environ.get('USE_WEBHOOK', 'true').lower() == 'true'
     WEBHOOK_PORT = int(os.environ.get('PORT', 5000))
     WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
-    WELCOME_IMAGE_URL = os.environ.get('WELCOME_IMAGE_URL', 'https://raw.githubusercontent.com/telegram-bot-community/resources/main/url-shortener-banner.jpg')
+    WELCOME_IMAGE_URL = os.environ.get('WELCOME_IMAGE_URL', 'https://iili.io/Kcbrql9.th.jpg')
     
     SUPPORTED_SERVICES = {
         'bitly': {

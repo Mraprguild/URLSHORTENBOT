@@ -9,7 +9,7 @@ CUTTLY_API = os.getenv('CUTTLY_API', '')
 GPLINKS_API = os.getenv('GPLINKS_API', '')
 
 # Welcome image URL
-WELCOME_IMAGE_URL = "https://images.unsplash.com/photo-1633356122544-f134324a6cee?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2070&q=80"
+WELCOME_IMAGE_URL = "https://raw.githubusercontent.com/Mraprguild8133/Bananabot/refs/heads/main/IMG-20250924-WA0007.jpg?token=GHSAT0AAAAAADKWGIRUR4Z2GMG76ZA77YQQ2GTV5CA"
 
 # Server port for Render
 PORT = int(os.environ.get('PORT', 5000))

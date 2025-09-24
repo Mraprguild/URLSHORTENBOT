@@ -6,7 +6,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 # API Keys for various services
 BITLY_TOKEN = os.getenv('BITLY_TOKEN', '')
 CUTTLY_API = os.getenv('CUTTLY_API', '')
-GPLINKS_API = os.getenv('GPLINKS_API', '')
+GPLINKS_API = os.getenv('GPLINKS_API', 'YOUR_GPLINKS_API_KEY_HERE')  # Make sure this is set
 
 # Supported URL shortening services
 SUPPORTED_SERVICES = {

@@ -1,395 +1,267 @@
-import os
 import logging
-import asyncio
-from datetime import datetime
-from typing import Dict, Any
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 
-from pyrogram import Client, filters, errors
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
+import config
 
-# Import configuration
-from config import config, Config
-
-# --- Setup Logging ---
+# Set up logging
 logging.basicConfig(
-    level=config.LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Validate Configuration ---
-if not config.validate_config():
-    logger.critical("Invalid configuration. Please check your environment variables.")
-    exit(1)
-
-# --- Initialize Pyrogram Client ---
-try:
-    app = Client(
-        "FileStoreBot",
-        api_id=config.API_ID,
-        api_hash=config.API_HASH,
-        bot_token=config.BOT_TOKEN,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    logger.info("Bot client initialized successfully")
-except Exception as e:
-    logger.critical(f"Failed to initialize Pyrogram client: {e}")
-    exit(1)
-
-# --- Utility Functions ---
-class FileUtils:
-    """Utility functions for file handling"""
-    
-    @staticmethod
-    def human_readable_size(size_bytes: int) -> str:
-        """Convert bytes to human readable format"""
-        if not size_bytes:
-            return "0 B"
+class URLShortenerBot:
+    def __init__(self, token):
+        self.token = token
+        self.application = Application.builder().token(token).build()
         
-        size_names = ["B", "KB", "MB", "GB", "TB"]
-        i = 0
-        while size_bytes >= 1024 and i < len(size_names) - 1:
-            size_bytes /= 1024.0
-            i += 1
-        return f"{size_bytes:.2f} {size_names[i]}"
-    
-    @staticmethod
-    def get_file_info(message: Message) -> Dict[str, Any]:
-        """Extract file information from message"""
-        file_info = {
-            "name": "Unknown",
-            "size": 0,
-            "type": "Unknown",
-            "mime_type": "",
-            "caption": message.caption or "",
-            "duration": 0,
-            "width": 0,
-            "height": 0
-        }
+        # Add handlers
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("help", self.help))
+        self.application.add_handler(CommandHandler("shorten", self.shorten))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(CallbackQueryHandler(self.button_handler))
         
-        if message.document:
-            file_info.update({
-                "name": message.document.file_name or "Unnamed document",
-                "size": message.document.file_size or 0,
-                "type": "Document",
-                "mime_type": message.document.mime_type or "Unknown"
-            })
-        elif message.video:
-            file_info.update({
-                "name": message.video.file_name or "Unnamed video",
-                "size": message.video.file_size or 0,
-                "type": "Video",
-                "mime_type": message.video.mime_type or "video/mp4",
-                "duration": message.video.duration or 0,
-                "width": message.video.width or 0,
-                "height": message.video.height or 0
-            })
-        elif message.audio:
-            file_info.update({
-                "name": message.audio.file_name or "Unnamed audio",
-                "size": message.audio.file_size or 0,
-                "type": "Audio",
-                "mime_type": message.audio.mime_type or "audio/mpeg",
-                "duration": message.audio.duration or 0
-            })
-        elif message.photo:
-            file_info.update({
-                "name": "Photo",
-                "size": message.photo.file_size or 0,
-                "type": "Photo",
-                "mime_type": "image/jpeg"
-            })
-        elif message.voice:
-            file_info.update({
-                "name": "Voice message",
-                "size": message.voice.file_size or 0,
-                "type": "Voice",
-                "mime_type": "audio/ogg",
-                "duration": message.voice.duration or 0
-            })
-        elif message.sticker:
-            file_info.update({
-                "name": "Sticker",
-                "size": message.sticker.file_size or 0,
-                "type": "Sticker",
-                "mime_type": "image/webp"
-            })
-        elif message.animation:
-            file_info.update({
-                "name": "Animation",
-                "size": message.animation.file_size or 0,
-                "type": "Animation",
-                "mime_type": "video/mp4",
-                "duration": message.animation.duration or 0,
-                "width": message.animation.width or 0,
-                "height": message.animation.height or 0
-            })
-        
-        return file_info
-    
-    @staticmethod
-    def format_file_caption(file_info: Dict[str, Any], user_mention: str) -> str:
-        """Format caption for stored files"""
-        caption = f"📁 **{file_info['name']}**\n\n"
-        caption += f"**Type:** {file_info['type']}\n"
-        caption += f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
-        
-        if file_info['mime_type']:
-            caption += f"**MIME Type:** {file_info['mime_type']}\n"
-        
-        if file_info['duration'] > 0:
-            minutes, seconds = divmod(file_info['duration'], 60)
-            caption += f"**Duration:** {minutes:02d}:{seconds:02d}\n"
-        
-        if file_info['width'] and file_info['height']:
-            caption += f"**Resolution:** {file_info['width']}x{file_info['height']}\n"
-        
-        caption += f"**Stored:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        caption += f"**Owner:** {user_mention}"
-        
-        if file_info['caption']:
-            caption += f"\n**Original Caption:** {file_info['caption']}"
-        
-        return caption
-
-
-# --- Error Handling Decorator ---
-def error_handler(func):
-    """Decorator to handle errors in handlers"""
-    async def wrapper(client: Client, message: Message):
+    def shorten_url(self, url, service):
+        """Shorten URL using the specified service"""
         try:
-            await func(client, message)
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait: {e.value} seconds")
-            await message.reply_text(f"❌ Too many requests. Please wait {e.value} seconds.")
-        except errors.RPCError as e:
-            logger.error(f"RPC Error in {func.__name__}: {e}")
-            await message.reply_text("❌ Telegram API error. Please try again later.")
+            if service == 'bitly' and config.BITLY_TOKEN:
+                headers = {
+                    'Authorization': f'Bearer {config.BITLY_TOKEN}',
+                    'Content-Type': 'application/json'
+                }
+                data = {'long_url': url}
+                response = requests.post(config.SUPPORTED_SERVICES['bitly']['api_url'], 
+                                       headers=headers, json=data)
+                if response.status_code == 200:
+                    return response.json()['link']
+            
+            elif service == 'tinyurl':
+                params = {'url': url}
+                response = requests.get(config.SUPPORTED_SERVICES['tinyurl']['api_url'], params=params)
+                if response.status_code == 200:
+                    return response.text
+            
+            elif service == 'cuttly' and config.CUTTLY_API:
+                params = {'key': config.CUTTLY_API, 'short': url}
+                response = requests.get(config.SUPPORTED_SERVICES['cuttly']['api_url'], params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data['url']['status'] == 7:
+                        return data['url']['shortLink']
+            
+            elif service == 'gplinks' and config.GPLINKS_API:
+                # GPLinks API implementation for gplinks.com
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json'
+                }
+                data = {
+                    'api': config.GPLINKS_API,
+                    'url': url
+                }
+                response = requests.post(config.SUPPORTED_SERVICES['gplinks']['api_url'], 
+                                       data=data, headers=headers)
+                
+                if response.status_code == 200:
+                    try:
+                        result = response.json()
+                        if result.get('status') == 'success' or 'shortenedUrl' in result:
+                            return result.get('shortenedUrl') or result.get('shorturl')
+                        elif 'error' in result:
+                            logger.error(f"GPLinks API error: {result.get('error')}")
+                    except ValueError:
+                        # If response is plain text
+                        return response.text.strip()
+            
+            return None
         except Exception as e:
-            logger.error(f"Unexpected error in {func.__name__}: {e}", exc_info=True)
-            await message.reply_text("❌ An unexpected error occurred. Please try again.")
+            logger.error(f"Error shortening URL with {service}: {e}")
+            return None
     
-    return wrapper
+    async def start(self, update: Update, context: CallbackContext):
+        """Send welcome message when command /start is issued"""
+        user = update.effective_user
+        welcome_text = f"""
+👋 Hello {user.mention_html()}!
 
+I'm a URL Shortener Bot! I can shorten your long URLs using various services.
 
-# --- Command Handlers ---
-@app.on_message(filters.command("start") & filters.private)
-@error_handler
-async def start_handler(client: Client, message: Message):
-    """Handle /start command"""
-    if message.from_user.id != config.OWNER_ID:
-        await message.reply_text("❌ Sorry, this is a private bot. You do not have permission to use it.")
-        logger.warning(f"Unauthorized access attempt by user {message.from_user.id}")
-        return
+📋 **Available Commands:**
+/start - Start the bot
+/help - Show help message
+/shorten - Shorten a URL
 
-    welcome_text = config.WELCOME_MESSAGE.format(
-        user_name=message.from_user.first_name,
-        bot_name=config.BOT_NAME,
-        max_size=int(config.MAX_FILE_SIZE / (1024 * 1024 * 1024))
-    )
+📊 **Supported Services:**
+- Bitly (Professional shortening)
+- TinyURL (Simple & reliable)
+- Cuttly (With analytics)
+- GPLinks (Monetization options)
+
+Simply send me a URL or use /shorten command!
+        """
+        await update.message.reply_html(welcome_text)
     
-    await message.reply_text(welcome_text)
-    logger.info(f"Owner {config.OWNER_ID} started the bot.")
+    async def help(self, update: Update, context: CallbackContext):
+        """Send help message"""
+        help_text = """
+🤖 **URL Shortener Bot Help**
 
+📖 **How to use:**
+1. Send me any long URL
+2. Or use /shorten <URL> command
+3. I'll provide shortened versions from different services
 
-@app.on_message(filters.command("help") & filters.private)
-@error_handler
-async def help_handler(client: Client, message: Message):
-    """Handle /help command"""
-    if message.from_user.id != config.OWNER_ID:
-        return
+🔗 **Example:**
+/shorten https://www.example.com/very-long-url-path
 
-    help_text = config.HELP_MESSAGE.format(
-        max_size=int(config.MAX_FILE_SIZE / (1024 * 1024 * 1024))
-    )
+🛠 **Supported Services:**
+- Bitly (requires API key setup)
+- TinyURL (works without API key)
+- Cuttly (requires API key setup)
+- GPLinks (requires API key setup)
+
+📝 **Note:** For Bitly, Cuttly, and GPLinks, you need to set up API keys in the bot configuration.
+TinyURL works without any API key!
+
+💰 **GPLinks Bonus:** Earn money from your shortened links!
+        """
+        await update.message.reply_text(help_text)
     
-    await message.reply_text(help_text)
-
-
-@app.on_message(filters.command("stats") & filters.private)
-@error_handler
-async def stats_handler(client: Client, message: Message):
-    """Handle /stats command"""
-    if message.from_user.id != config.OWNER_ID or not config.ENABLE_STATS:
-        return
-
-    try:
-        bot_info = config.get_bot_info()
-        stats_text = (
-            f"📊 **{config.BOT_NAME} - Statistics**\n\n"
-            f"**Storage Channel:** `{config.STORAGE_CHANNEL_ID}`\n"
-            f"**Max File Size:** {bot_info['max_file_size_gb']}GB\n"
-            f"**Supported Formats:** {', '.join(bot_info['supported_formats'])}\n"
-            f"**Owner:** {message.from_user.mention}\n"
-            f"**Bot Status:** ✅ Operational\n\n"
-            f"*Detailed analytics coming in future updates...*"
-        )
+    async def shorten(self, update: Update, context: CallbackContext):
+        """Shorten URL from command"""
+        if not context.args:
+            await update.message.reply_text("Please provide a URL to shorten. Usage: /shorten <URL>")
+            return
         
-        await message.reply_text(stats_text)
-        logger.info(f"Stats requested by owner {config.OWNER_ID}")
-        
-    except Exception as e:
-        await message.reply_text(f"❌ Error getting statistics: {str(e)}")
-        logger.error(f"Error in stats handler: {e}")
-
-
-@app.on_message(filters.command("config") & filters.private & filters.user(config.OWNER_ID))
-@error_handler
-async def config_handler(client: Client, message: Message):
-    """Show current configuration (owner only)"""
-    bot_info = config.get_bot_info()
+        url = ' '.join(context.args)
+        await self.process_url(update, url)
     
-    config_text = (
-        f"⚙️ **{config.BOT_NAME} - Configuration**\n\n"
-        f"**Environment:** {os.getenv('ENVIRONMENT', 'production')}\n"
-        f"**Owner ID:** `{config.OWNER_ID}`\n"
-        f"**Storage Channel:** `{config.STORAGE_CHANNEL_ID}`\n"
-        f"**Max File Size:** {bot_info['max_file_size_gb']}GB\n\n"
-        f"**Enabled Features:**\n"
-    )
-    
-    for feature, enabled in bot_info['features'].items():
-        config_text += f"• {feature}: {'✅' if enabled else '❌'}\n"
-    
-    await message.reply_text(config_text)
-
-
-@app.on_message(config.get_supported_media_filters() & filters.private)
-@error_handler
-async def file_handler(client: Client, message: Message):
-    """Handle incoming files"""
-    if message.from_user.id != config.OWNER_ID:
-        await message.reply_text("❌ Sorry, you are not authorized to store files.")
-        return
-
-    # Get file information
-    file_info = FileUtils.get_file_info(message)
-    
-    # Check file size
-    if file_info['size'] > config.MAX_FILE_SIZE:
-        await message.reply_text(
-            f"❌ File too large! Maximum size is {config.MAX_FILE_SIZE / (1024**3):.1f}GB. "
-            f"Your file is {file_info['size'] / (1024**3):.1f}GB."
-        )
-        return
-
-    logger.info(f"Received {file_info['type']} from owner: {file_info['name']}")
-
-    # Show processing message
-    processing_text = (
-        f"📤 **Uploading File...**\n\n"
-        f"**Name:** {file_info['name']}\n"
-        f"**Type:** {file_info['type']}\n"
-        f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
-        f"**Status:** Processing..."
-    )
-    
-    processing_message = await message.reply_text(processing_text)
-
-    try:
-        # Format caption and store file
-        file_caption = FileUtils.format_file_caption(file_info, message.from_user.mention)
+    async def handle_message(self, update: Update, context: CallbackContext):
+        """Handle messages containing URLs"""
+        url = update.message.text
         
-        # Forward the file to storage channel
-        forwarded_message = await message.copy(
-            config.STORAGE_CHANNEL_ID,
-            caption=file_caption
-        )
+        # Basic URL validation
+        if not (url.startswith('http://') or url.startswith('https://')):
+            await update.message.reply_text("Please send a valid URL starting with http:// or https://")
+            return
         
-        # Create download button
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📥 Download File", url=forwarded_message.link)
-        ]])
+        await self.process_url(update, url)
+    
+    async def process_url(self, update: Update, url: str):
+        """Process URL and generate shortened versions"""
+        # Show typing action
+        await update.message.reply_chat_action(action="typing")
         
-        # Success message
-        success_text = (
-            f"✅ **File Stored Successfully!**\n\n"
-            f"**Name:** {file_info['name']}\n"
-            f"**Type:** {file_info['type']}\n"
-            f"**Size:** {FileUtils.human_readable_size(file_info['size'])}\n"
-            f"**Storage:** Private Channel\n\n"
-            f"**Download Link Ready!**"
-        )
+        # Create keyboard with service options
+        keyboard = [
+            [
+                InlineKeyboardButton("Bitly", callback_data=f"shorten_bitly_{url}"),
+                InlineKeyboardButton("TinyURL", callback_data=f"shorten_tinyurl_{url}"),
+            ],
+            [
+                InlineKeyboardButton("Cuttly", callback_data=f"shorten_cuttly_{url}"),
+                InlineKeyboardButton("GPLinks", callback_data=f"shorten_gplinks_{url}"),
+            ],
+            [InlineKeyboardButton("All Services", callback_data=f"shorten_all_{url}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await processing_message.edit_text(
-            success_text, 
-            reply_markup=keyboard,
+        await update.message.reply_text(
+            f"🔗 Original URL: {url}\n\nChoose a service to shorten:",
+            reply_markup=reply_markup,
             disable_web_page_preview=True
         )
+    
+    async def button_handler(self, update: Update, context: CallbackContext):
+        """Handle button callbacks"""
+        query = update.callback_query
+        await query.answer()
         
-        logger.info(f"File stored successfully: {file_info['name']}")
-
-    except errors.FloodWait as e:
-        error_text = f"❌ **Upload Failed**\n\nToo many requests. Please wait {e.value} seconds."
-        await processing_message.edit_text(error_text)
-        logger.warning(f"Flood wait during file upload: {e.value} seconds")
+        data = query.data
+        if data.startswith('shorten_'):
+            _, service, url = data.split('_', 2)
+            url = url.replace('_', '/').replace('|', ':')  # Reverse URL encoding
+            
+            if service == 'all':
+                await self.send_all_shortened_urls(query, url)
+            else:
+                await self.send_single_shortened_url(query, url, service)
+    
+    async def send_single_shortened_url(self, query, url: str, service: str):
+        """Send shortened URL from a single service"""
+        shortened_url = self.shorten_url(url, service)
         
-    except errors.ChatAdminRequired:
-        error_text = "❌ **Upload Failed**\n\nBot needs admin rights in the storage channel."
-        await processing_message.edit_text(error_text)
-        logger.error("Bot doesn't have admin rights in storage channel")
+        if shortened_url:
+            service_name = config.SUPPORTED_SERVICES[service]['name']
+            message = f"✅ **{service_name}**\n🔗 {shortened_url}"
+            
+            # Add special note for GPLinks
+            if service == 'gplinks':
+                message += "\n\n💰 *Earn money with this shortened link!*"
+            
+            await query.edit_message_text(
+                text=message,
+                disable_web_page_preview=True,
+                parse_mode='Markdown'
+            )
+        else:
+            service_name = config.SUPPORTED_SERVICES[service]['name']
+            error_msg = f"❌ Failed to shorten URL using {service_name}."
+            if config.SUPPORTED_SERVICES[service]['requires_key']:
+                error_msg += " API key might not be configured."
+            else:
+                error_msg += " Service might be temporarily unavailable."
+            
+            await query.edit_message_text(text=error_msg)
+    
+    async def send_all_shortened_urls(self, query, url: str):
+        """Send shortened URLs from all available services"""
+        message = "🔗 **Shortened URLs**\n\n"
+        successful_shortens = 0
         
-    except Exception as e:
-        error_text = (
-            f"❌ **Upload Failed**\n\n"
-            f"**Error:** {str(e)}\n\n"
-            f"Please try again or check if the bot has admin rights in the storage channel."
+        for service in config.SUPPORTED_SERVICES:
+            shortened_url = self.shorten_url(url, service)
+            service_name = config.SUPPORTED_SERVICES[service]['name']
+            
+            if shortened_url:
+                message += f"✅ **{service_name}**\n{shortened_url}"
+                if service == 'gplinks':
+                    message += " 💰"
+                message += "\n\n"
+                successful_shortens += 1
+            else:
+                reason = "API key not configured" if config.SUPPORTED_SERVICES[service]['requires_key'] else "Service unavailable"
+                message += f"❌ **{service_name}** - {reason}\n\n"
+        
+        if successful_shortens == 0:
+            message = "❌ All services failed to shorten the URL. Please try again later or check API key configurations.\n\n💡 **Tip:** TinyURL works without API key setup!"
+        else:
+            message += f"\n✅ **{successful_shortens} out of {len(config.SUPPORTED_SERVICES)} services successful**"
+            if any(service in message for service in ['GPLinks']):
+                message += "\n💰 *GPLinks links can generate revenue!*"
+        
+        await query.edit_message_text(
+            text=message,
+            disable_web_page_preview=True,
+            parse_mode='Markdown'
         )
-        await processing_message.edit_text(error_text)
-        logger.error(f"Failed to store file: {e}", exc_info=True)
-
-
-# --- Global Exception Handler ---
-async def handle_global_error(update, error):
-    """Global error handler for uncaught exceptions"""
-    logger.error(f"Global error handler: {error}", exc_info=True)
-
-
-# --- Main Execution ---
-async def main():
-    """Main function to start the bot"""
-    logger.info(f"Starting {config.BOT_NAME}...")
     
-    # Test channel access
-    try:
-        chat = await app.get_chat(config.STORAGE_CHANNEL_ID)
-        logger.info(f"Storage channel: {chat.title} (ID: {config.STORAGE_CHANNEL_ID})")
-    except errors.ChatAdminRequired:
-        logger.error("Bot doesn't have access to the storage channel. Make sure it's added as admin.")
-        return
-    except errors.ChannelInvalid:
-        logger.error("Invalid storage channel ID. Make sure it starts with -100 and the bot is added.")
-        return
-    except Exception as e:
-        logger.error(f"Cannot access storage channel: {e}")
+    def run(self):
+        """Start the bot"""
+        self.application.run_polling()
+
+def main():
+    """Main function to run the bot"""
+    if not config.BOT_TOKEN or config.BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+        print("Error: Please set your BOT_TOKEN in environment variables or .env file")
         return
     
-    # Start the bot
-    await app.start()
-    
-    # Get bot info
-    bot_info = await app.get_me()
-    logger.info(f"Bot @{bot_info.username} is now running!")
-    
-    # Display bot information
-    logger.info(f"Bot Name: {config.BOT_NAME}")
-    logger.info(f"Owner ID: {config.OWNER_ID}")
-    logger.info(f"Storage Channel: {config.STORAGE_CHANNEL_ID}")
-    logger.info(f"Max File Size: {config.MAX_FILE_SIZE / (1024**3)}GB")
-    logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
-    
-    # Keep the bot running
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.critical(f"Bot crashed: {e}")
-    finally:
-        await app.stop()
-        logger.info("Bot has stopped.")
+    bot = URLShortenerBot(config.BOT_TOKEN)
+    print("Bot is running...")
+    bot.run()
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    main()

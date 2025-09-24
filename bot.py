@@ -22,7 +22,7 @@ class Config:
     USE_WEBHOOK = os.environ.get('USE_WEBHOOK', 'true').lower() == 'true'
     WEBHOOK_PORT = int(os.environ.get('PORT', 5000))
     WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
-    WELCOME_IMAGE_URL = os.environ.get('https://ibb.co/BKygJJNw')
+    WELCOME_IMAGE_URL = os.environ.get('https://envs.sh/5l9.jpg')
     
     SUPPORTED_SERVICES = {
         'bitly': {

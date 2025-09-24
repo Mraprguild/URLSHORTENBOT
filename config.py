@@ -8,9 +8,9 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
 # URL Shortener Services API Keys
 BITLY_TOKEN = os.getenv('BITLY_TOKEN', '')
-TINYURL_API = os.getenv('TINYURL_API', '')
-ISGD_API = os.getenv('ISGD_API', '')  # No API key needed but included for structure
+TINYURL_API = os.getenv('TINYURL_API', '')  # Actually no API key needed, but kept for structure
 CUTTLY_API = os.getenv('CUTTLY_API', '')
+GPLINKS_API = os.getenv('GPLINKS_API', '')
 
 # Service Configuration
 SUPPORTED_SERVICES = {
@@ -24,14 +24,15 @@ SUPPORTED_SERVICES = {
         'api_url': 'http://tinyurl.com/api-create.php',
         'requires_key': False
     },
-    'isgd': {
-        'name': 'ISGD',
-        'api_url': 'https://is.gd/create.php',
-        'requires_key': False
-    },
     'cuttly': {
         'name': 'Cuttly',
         'api_url': 'https://cutt.ly/api/api.php',
         'requires_key': True
+    },
+    'gplinks': {
+        'name': 'GPLinks',
+        'api_url': 'https://gplinks.com/api',
+        'requires_key': True,
+        'method': 'POST'
     }
 }

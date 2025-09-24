@@ -23,5 +23,5 @@ dependencies = [
     "flask>=3.1.2",
     "telethon>=1.41.2",
     "gunicorn>=21.2.0",
-    "python-telegram-bot[job-queue,webhooks]==20.7",
+    "python-telegram-bot[job-queue,webhooks]>=20.7",
    ]

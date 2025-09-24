@@ -12,6 +12,9 @@ TINYURL_API = os.getenv('TINYURL_API', '')  # Actually no API key needed, but ke
 CUTTLY_API = os.getenv('CUTTLY_API', '')
 GPLINKS_API = os.getenv('GPLINKS_API', '')
 
+# Optional: Welcome image URL
+WELCOME_IMAGE_URL = os.environ.get('WELCOME_IMAGE_URL', '')
+
 # Service Configuration
 SUPPORTED_SERVICES = {
     'bitly': {

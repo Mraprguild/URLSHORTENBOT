@@ -1,18 +1,14 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# Bot Configuration
+# Bot Token from BotFather
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
-# URL Shortener Services API Keys
+# API Keys for various services
 BITLY_TOKEN = os.getenv('BITLY_TOKEN', '')
-TINYURL_API = os.getenv('TINYURL_API', '')  # Actually no API key needed, but kept for structure
 CUTTLY_API = os.getenv('CUTTLY_API', '')
 GPLINKS_API = os.getenv('GPLINKS_API', '')
 
-# Service Configuration
+# Supported URL shortening services
 SUPPORTED_SERVICES = {
     'bitly': {
         'name': 'Bitly',
@@ -31,8 +27,7 @@ SUPPORTED_SERVICES = {
     },
     'gplinks': {
         'name': 'GPLinks',
-        'api_url': 'https://gplinks.com/api',
-        'requires_key': True,
-        'method': 'POST'
+        'api_url': 'https://gplinks.in/api',
+        'requires_key': True
     }
 }

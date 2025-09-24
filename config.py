@@ -17,7 +17,7 @@ CUTTLY_API = os.getenv('CUTTLY_API', '')
 GPLINKS_API = os.getenv('GPLINKS_API', '')
 
 # Optional: Welcome image URL
-WELCOME_IMAGE_URL = ('https://iili.io/Kcbrql9.th.jpg')
+WELCOME_IMAGE_URL = ('WELCOME_IMAGE_URL','https://iili.io/Kcbrql9.th.jpg')
 
 # Service Configuration
 SUPPORTED_SERVICES = {

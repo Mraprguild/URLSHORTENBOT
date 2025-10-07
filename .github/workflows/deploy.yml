@@ -22,11 +22,12 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Run basic checks
       run: |
         python -c "import requests; import sqlite3; print('All imports successful')"
+        # Add any additional tests specific to your bot
 
   deploy:
     runs-on: ubuntu-latest
@@ -37,6 +38,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Deploy to Render
+    - name: Deploy to Render via Webhook
       run: |
-        curl -X POST "${{https://aprurlshotnerbot.onrender.com}}"
+        # Replace with your actual Render deploy hook URL
+        curl -X POST "https://api.render.com/deploy/srv-d3ih9dbipnbc73e6m3lg?key=e3iV_mV7Kq0"
